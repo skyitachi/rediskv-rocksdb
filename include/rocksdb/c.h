@@ -1827,6 +1827,11 @@ extern ROCKSDB_LIBRARY_API void rocksdb_dbpath_destroy(rocksdb_dbpath_t*);
 
 extern ROCKSDB_LIBRARY_API rocksdb_env_t* rocksdb_create_default_env(void);
 extern ROCKSDB_LIBRARY_API rocksdb_env_t* rocksdb_create_mem_env(void);
+extern ROCKSDB_LIBRARY_API rocksdb_backup_engine_t* rocksdb_s3_backup_engine_open(
+    const rocksdb_options_t* options,
+    const char *endpoint, const char *access_id, const char *secret_key,
+    const char *bucket, const char *prefix, const char *local_path,
+    char** errptr);
 extern ROCKSDB_LIBRARY_API void rocksdb_env_set_background_threads(
     rocksdb_env_t* env, int n);
 extern ROCKSDB_LIBRARY_API int rocksdb_env_get_background_threads(

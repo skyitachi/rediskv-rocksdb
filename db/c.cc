@@ -4384,6 +4384,30 @@ rocksdb_env_t* rocksdb_create_mem_env() {
   return result;
 }
 
+rocksdb_backup_engine_t* rocksdb_s3_backup_engine_open(
+    const rocksdb_options_t* options,
+    const char *endpoint, const char *access_id, const char* secret_key,
+    const char *bucket, const char *prefix, const char *local_path,
+    char** errptr) {
+  // BackupEngine* be;
+  // auto s3_util = S3Util::BuildS3Util(endpoint, access_id, secret_key, bucket);
+  // Env* s3_env =
+  //     new ROCKSDB_NAMESPACE::S3Env(prefix, local_path, s3_util);
+
+  // if (SaveError(errptr, BackupEngine::Open(options->rep.env,
+  //         BackupableDBOptions(prefix,
+  //                             s3_env,
+  //                             true,
+  //                             options->rep.info_log.get()),
+  //                             &be))) {
+  //   return nullptr;
+  // }
+  // rocksdb_backup_engine_t* result = new rocksdb_backup_engine_t;
+  // result->rep = be;
+  // return result;
+  return nullptr;
+}
+
 void rocksdb_env_set_background_threads(rocksdb_env_t* env, int n) {
   env->rep->SetBackgroundThreads(n);
 }
