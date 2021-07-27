@@ -5550,6 +5550,11 @@ uint64_t rocksdb_get_total_size(rocksdb_t *db) {
   return sfm->GetTotalSize();
 }
 
+void rocksdb_options_wal_readahead_size(
+    rocksdb_options_t* opt, size_t s) {
+  opt->rep.log_readahead_size = s;
+}
+
 }  // end extern "C"
 
 #endif  // !ROCKSDB_LITE

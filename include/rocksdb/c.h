@@ -2329,6 +2329,8 @@ extern ROCKSDB_LIBRARY_API void rocksdb_cancel_all_background_work(
     rocksdb_t* db, unsigned char wait);
 
 extern ROCKSDB_LIBRARY_API uint64_t rocksdb_get_total_size(rocksdb_t *db);
+extern ROCKSDB_LIBRARY_API void rocksdb_options_wal_readahead_size(
+    rocksdb_options_t* opt, size_t s);
 
 #ifdef __cplusplus
 }  /* end extern "C" */
