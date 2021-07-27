@@ -20,7 +20,11 @@ class CheckpointImpl : public Checkpoint {
 
   Status CreateCheckpoint(const std::string& checkpoint_dir,
                           uint64_t log_size_for_flush,
-                          uint64_t* sequence_number_ptr) override;
+                          uint64_t* sequence_number_ptr,
+                          int(*consistentPointCallback)()) override;
+
+  Status CreateCheckpointWithSequence(const std::string& checkpoint_dir,
+                                              int(*consistentPointCallback)()) override;
 
   Status ExportColumnFamily(ColumnFamilyHandle* handle,
                             const std::string& export_dir,
@@ -42,7 +46,8 @@ class CheckpointImpl : public Checkpoint {
                            const std::string& contents, FileType type)>
           create_file_cb,
       uint64_t* sequence_number, uint64_t log_size_for_flush,
-      bool get_live_table_checksum = false);
+      bool get_live_table_checksum = false,
+      std::function<int()> = nullptr);
 
  private:
   void CleanStagingDirectory(const std::string& path, Logger* info_log);

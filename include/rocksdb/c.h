@@ -159,8 +159,17 @@ extern ROCKSDB_LIBRARY_API void rocksdb_backup_engine_create_new_backup_flush(
     rocksdb_backup_engine_t* be, rocksdb_t* db, unsigned char flush_before_backup,
     char** errptr);
 
+extern void rocksdb_backup_engine_create_new_backup_with_sequence(
+    rocksdb_backup_engine_t* be,
+    rocksdb_t* db,
+    int(*consistentPointCallback)(),
+    char** errptr);
+
 extern ROCKSDB_LIBRARY_API void rocksdb_backup_engine_purge_old_backups(
     rocksdb_backup_engine_t* be, uint32_t num_backups_to_keep, char** errptr);
+
+extern ROCKSDB_LIBRARY_API void rocksdb_backup_engine_delete_backup(
+    rocksdb_backup_engine_t* be, uint32_t backup_id, char** errptr);
 
 extern ROCKSDB_LIBRARY_API rocksdb_restore_options_t*
 rocksdb_restore_options_create(void);
@@ -310,6 +319,12 @@ rocksdb_checkpoint_object_create(rocksdb_t* db, char** errptr);
 extern ROCKSDB_LIBRARY_API void rocksdb_checkpoint_create(
     rocksdb_checkpoint_t* checkpoint, const char* checkpoint_dir,
     uint64_t log_size_for_flush, char** errptr);
+
+
+extern ROCKSDB_LIBRARY_API void rocksdb_checkpoint_create_with_sequence(
+    rocksdb_checkpoint_t* checkpoint, const char* checkpoint_dir,
+    int(*consistentPointCallback)(),
+    char** errptr);
 
 extern ROCKSDB_LIBRARY_API void rocksdb_checkpoint_object_destroy(
     rocksdb_checkpoint_t* checkpoint);
@@ -668,7 +683,8 @@ extern ROCKSDB_LIBRARY_API void rocksdb_writebatch_put_log_data(
 extern ROCKSDB_LIBRARY_API void rocksdb_writebatch_iterate(
     rocksdb_writebatch_t*, void* state,
     void (*put)(void*, const char* k, size_t klen, const char* v, size_t vlen),
-    void (*deleted)(void*, const char* k, size_t klen));
+    void (*deleted)(void*, const char* k, size_t klen),
+    void (*logdata)(void*, const char* d, size_t dlen));
 extern ROCKSDB_LIBRARY_API const char* rocksdb_writebatch_data(
     rocksdb_writebatch_t*, size_t* size);
 extern ROCKSDB_LIBRARY_API void rocksdb_writebatch_set_save_point(
@@ -953,6 +969,8 @@ extern ROCKSDB_LIBRARY_API void rocksdb_options_set_compression_per_level(
     rocksdb_options_t* opt, int* level_values, size_t num_levels);
 extern ROCKSDB_LIBRARY_API void rocksdb_options_set_create_if_missing(
     rocksdb_options_t*, unsigned char);
+extern void rocksdb_options_set_crc32_file_checksum(
+    rocksdb_options_t* opt);
 extern ROCKSDB_LIBRARY_API unsigned char rocksdb_options_get_create_if_missing(
     rocksdb_options_t*);
 extern ROCKSDB_LIBRARY_API void
@@ -2309,6 +2327,8 @@ rocksdb_options_set_memtable_whole_key_filtering(rocksdb_options_t*,
 
 extern ROCKSDB_LIBRARY_API void rocksdb_cancel_all_background_work(
     rocksdb_t* db, unsigned char wait);
+
+extern ROCKSDB_LIBRARY_API uint64_t rocksdb_get_total_size(rocksdb_t *db);
 
 #ifdef __cplusplus
 }  /* end extern "C" */

@@ -1362,7 +1362,8 @@ Status BackupEngineImpl::CreateNewBackupWithMetadata(
               options.progress_callback, contents);
         } /* create_file_cb */,
         &sequence_number, options.flush_before_backup ? 0 : port::kMaxUint64,
-        compare_checksum);
+        compare_checksum,
+        options.consistentPointCallback);
     if (s.ok()) {
       new_backup->SetSequenceNumber(sequence_number);
     }
