@@ -47,6 +47,7 @@
 #include "rocksdb/write_batch.h"
 #include "utilities/merge_operators.h"
 #include "rocksdb/sst_file_manager.h"
+#include "s3/env_s3.h"
 
 using ROCKSDB_NAMESPACE::BackupableDBOptions;
 using ROCKSDB_NAMESPACE::BackupEngine;
@@ -123,6 +124,7 @@ using ROCKSDB_NAMESPACE::WriteOptions;
 
 using std::vector;
 using std::unordered_set;
+using s3::S3Util;
 
 extern "C" {
 
@@ -4389,23 +4391,22 @@ rocksdb_backup_engine_t* rocksdb_s3_backup_engine_open(
     const char *endpoint, const char *access_id, const char* secret_key,
     const char *bucket, const char *prefix, const char *local_path,
     char** errptr) {
-  // BackupEngine* be;
-  // auto s3_util = S3Util::BuildS3Util(endpoint, access_id, secret_key, bucket);
-  // Env* s3_env =
-  //     new ROCKSDB_NAMESPACE::S3Env(prefix, local_path, s3_util);
+  BackupEngine* be;
+  auto s3_util = S3Util::BuildS3Util(endpoint, access_id, secret_key, bucket);
+  Env* s3_env =
+      new ROCKSDB_NAMESPACE::S3Env(prefix, local_path, s3_util);
 
-  // if (SaveError(errptr, BackupEngine::Open(options->rep.env,
-  //         BackupableDBOptions(prefix,
-  //                             s3_env,
-  //                             true,
-  //                             options->rep.info_log.get()),
-  //                             &be))) {
-  //   return nullptr;
-  // }
-  // rocksdb_backup_engine_t* result = new rocksdb_backup_engine_t;
-  // result->rep = be;
-  // return result;
-  return nullptr;
+  if (SaveError(errptr, BackupEngine::Open(options->rep.env,
+          BackupableDBOptions(prefix,
+                              s3_env,
+                              true,
+                              options->rep.info_log.get()),
+                              &be))) {
+    return nullptr;
+  }
+  rocksdb_backup_engine_t* result = new rocksdb_backup_engine_t;
+  result->rep = be;
+  return result;
 }
 
 void rocksdb_env_set_background_threads(rocksdb_env_t* env, int n) {

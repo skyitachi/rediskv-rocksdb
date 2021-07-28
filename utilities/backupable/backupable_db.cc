@@ -1374,9 +1374,15 @@ Status BackupEngineImpl::CreateNewBackupWithMetadata(
     item.result.wait();
     auto result = item.result.get();
     item_status = result.status;
-    if (item_status.ok() && item.shared && item.needed_to_copy) {
-      item_status =
-          item.backup_env->RenameFile(item.dst_path_tmp, item.dst_path);
+    if (item_status.ok()) {
+      if (item.shared && item.needed_to_copy) {
+          item_status =
+              item.backup_env->RenameFile(item.dst_path_tmp, item.dst_path);
+      } else {
+          // In current implementation, object upload are triggered by rename ops.
+          item_status =
+              item.backup_env->RenameFile(item.dst_path, item.dst_path);
+      }
     }
     if (item_status.ok()) {
       item_status = new_backup.get()->AddFile(std::make_shared<FileInfo>(
