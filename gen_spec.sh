@@ -28,14 +28,14 @@ builds:
     cache:
       "/usr/include/rocksdb": "/usr/include/rocksdb"
       "/usr/lib/librocksdb.a": "/usr/lib/librocksdb.a"
-      "/usr/lib/librocksdb.so.6.15.5": "/usr/lib/librocksdb.so.6.15.5"
+      "/usr/lib/librocksdb.so.6.23.1": "/usr/lib/librocksdb.so.6.23.1"
   pack:
     base: harbor.shopeemobile.com/cloud/aws-sdk-cpp:1.9.31
     commands:
       - >
         apk update &&
         apk add snappy zlib lz4-dev boost &&
-        ln -s /usr/lib/librocksdb.so.6.15.5 /usr/lib/librocksdb.so.6.15 &&
-        ln -s /usr/lib/librocksdb.so.6.15.5 /usr/lib/librocksdb.so.6 &&
-        ln -s /usr/lib/librocksdb.so.6.15.5 /usr/lib/librocksdb.so
+        ln -s /usr/lib/librocksdb.so.6.23.1 /usr/lib/librocksdb.so.6.23 &&
+        ln -s /usr/lib/librocksdb.so.6.23.1 /usr/lib/librocksdb.so.6 &&
+        ln -s /usr/lib/librocksdb.so.6.23.1 /usr/lib/librocksdb.so
 EOF
