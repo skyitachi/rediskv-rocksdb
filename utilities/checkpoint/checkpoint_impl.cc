@@ -127,7 +127,9 @@ Status CheckpointImpl::CreateCheckpoint(const std::string& checkpoint_dir,
       s = CreateCustomCheckpoint(
           db_options,
           [&](const std::string& src_dirname, const std::string& fname,
-              FileType) {
+              FileType,
+              const std::string& /* checksum_func_name */,
+              const std::string& /* checksum_val */) {
             ROCKS_LOG_INFO(db_options.info_log, "Hard Linking %s",
                            fname.c_str());
             return db_->GetFileSystem()->LinkFile(src_dirname + fname,
@@ -196,7 +198,8 @@ Status CheckpointImpl::CreateCheckpointWithSequence(const std::string& checkpoin
 Status CheckpointImpl::CreateCustomCheckpoint(
     const DBOptions& db_options,
     std::function<Status(const std::string& src_dirname,
-                         const std::string& src_fname, FileType type)>
+                         const std::string& src_fname, FileType type,
+                         const std::string& checksum_func_name, const std::string& checksum_val)>
         link_file_cb,
     std::function<Status(
         const std::string& src_dirname, const std::string& src_fname,
@@ -352,35 +355,37 @@ Status CheckpointImpl::CreateCustomCheckpoint(
     const uint64_t number = std::get<1>(file);
     const FileType type = std::get<2>(file);
 
+    std::string checksum_name = kUnknownFileChecksumFuncName;
+    std::string checksum_value = kUnknownFileChecksum;
+
+    // we ignore the checksums either they are not required or we failed to
+    // obtain the checksum list for old table files that have no file
+    // checksums
+    if (get_live_table_checksum) {
+      // find checksum info for table files
+      Status search = checksum_list->SearchOneFileChecksum(
+          number, &checksum_value, &checksum_name);
+
+      // could be a legacy file lacking checksum info. overall OK if
+      // not found
+      if (!search.ok()) {
+        assert(checksum_name == kUnknownFileChecksumFuncName);
+        assert(checksum_value == kUnknownFileChecksum);
+      }
+    }
+
     // rules:
     // * for kTableFile/kBlobFile, attempt hard link instead of copy.
     // * but can't hard link across filesystems.
     if (same_fs) {
-      s = link_file_cb(db_->GetName(), src_fname, type);
+      s = link_file_cb(db_->GetName(), src_fname, kTableFile, checksum_name,
+                       checksum_value);
       if (s.IsNotSupported()) {
         same_fs = false;
         s = Status::OK();
       }
     }
     if (!same_fs) {
-      std::string checksum_name = kUnknownFileChecksumFuncName;
-      std::string checksum_value = kUnknownFileChecksum;
-
-      // we ignore the checksums either they are not required or we failed to
-      // obtain the checksum list for old table files that have no file
-      // checksums
-      if (get_live_table_checksum) {
-        // find checksum info for table files
-        Status search = checksum_list->SearchOneFileChecksum(
-            number, &checksum_value, &checksum_name);
-
-        // could be a legacy file lacking checksum info. overall OK if
-        // not found
-        if (!search.ok()) {
-          assert(checksum_name == kUnknownFileChecksumFuncName);
-          assert(checksum_value == kUnknownFileChecksum);
-        }
-      }
       s = copy_file_cb(db_->GetName(), src_fname, 0, type, checksum_name,
                        checksum_value);
     }
@@ -407,7 +412,7 @@ Status CheckpointImpl::CreateCustomCheckpoint(
       if (same_fs) {
         // we only care about live log files
         s = link_file_cb(db_options.wal_dir, live_wal_files[i]->PathName(),
-                         kWalFile);
+                         kWalFile, kUnknownFileChecksumFuncName, kUnknownFileChecksum);
         if (s.IsNotSupported()) {
           same_fs = false;
           s = Status::OK();

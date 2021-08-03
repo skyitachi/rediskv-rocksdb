@@ -35,7 +35,9 @@ class CheckpointImpl : public Checkpoint {
   Status CreateCustomCheckpoint(
       const DBOptions& db_options,
       std::function<Status(const std::string& src_dirname,
-                           const std::string& fname, FileType type)>
+                           const std::string& fname, FileType type,
+                           const std::string& checksum_func_name,
+                           const std::string& checksum_val)>
           link_file_cb,
       std::function<Status(const std::string& src_dirname,
                            const std::string& fname, uint64_t size_limit_bytes,
