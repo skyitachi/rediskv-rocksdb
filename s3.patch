@@ -1,0 +1,16 @@
+diff --git a/crt/aws-crt-cpp/crt/aws-c-common/source/posix/thread.c b/crt/aws-crt-cpp/crt/aws-c-common/source/posix/thread.c
+index 37f0a31..645ba3b 100644
+--- a/crt/aws-crt-cpp/crt/aws-c-common/source/posix/thread.c
++++ b/crt/aws-crt-cpp/crt/aws-c-common/source/posix/thread.c
+@@ -61,6 +61,11 @@ struct thread_wrapper {
+ 
+ static AWS_THREAD_LOCAL struct thread_wrapper *tl_wrapper = NULL;
+ 
++int pthread_attr_setaffinity_np(pthread_attr_t *attr, size_t cpusetsize, const cpu_set_t *cpuset)
++{
++    return 0;
++}
++
+ /*
+  * thread_wrapper is platform-dependent so this function ends up being duplicated in each thread implementation
+  */
