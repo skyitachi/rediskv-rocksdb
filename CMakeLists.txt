@@ -65,6 +65,7 @@ endif(CCACHE_FOUND)
 option(WITH_JEMALLOC "build with JeMalloc" OFF)
 option(WITH_LIBURING "build with liburing" ON)
 option(WITH_SNAPPY "build with SNAPPY" OFF)
+option(WITH_AWSS3 "build with AWSS3" OFF)
 option(WITH_LZ4 "build with lz4" OFF)
 option(WITH_ZLIB "build with zlib" OFF)
 option(WITH_ZSTD "build with zstd" OFF)
@@ -92,7 +93,7 @@ else()
 endif()
 
 if( NOT DEFINED CMAKE_CXX_STANDARD )
-  set(CMAKE_CXX_STANDARD 11)
+  set(CMAKE_CXX_STANDARD 14)
 endif()
 
 include(CMakeDependentOption)
@@ -148,6 +149,12 @@ else()
     endif()
     add_definitions(-DSNAPPY)
     list(APPEND THIRDPARTY_LIBS Snappy::snappy)
+  endif()
+
+  if(WITH_AWSS3)
+    find_package(AWSSDK REQUIRED)
+    add_definitions(-DAWSSDK)
+    list(APPEND THIRDPARTY_LIBS aws-cpp-sdk-s3)
   endif()
 
   if(WITH_ZLIB)
@@ -708,6 +715,7 @@ set(SOURCES
         env/env_chroot.cc
         env/env_encryption.cc
         env/env_hdfs.cc
+        env/env_s3.cc
         env/file_system.cc
         env/file_system_tracer.cc
         env/fs_remap.cc
@@ -757,6 +765,8 @@ set(SOURCES
         options/options_helper.cc
         options/options_parser.cc
         port/stack_trace.cc
+        s3/aws_s3_rate_limiter.cc
+        s3/s3util.cc
         table/adaptive/adaptive_table_factory.cc
         table/block_based/binary_search_index_reader.cc
         table/block_based/block.cc

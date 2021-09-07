@@ -1293,11 +1293,38 @@ Status BackupEngineImpl::CreateNewBackupWithMetadata(
     EnvOptions src_raw_env_options(db_options);
     s = checkpoint.CreateCustomCheckpoint(
         db_options,
-        [&](const std::string& /*src_dirname*/, const std::string& /*fname*/,
-            FileType) {
-          // custom checkpoint will switch to calling copy_file_cb after it sees
-          // NotSupported returned from link_file_cb.
-          return Status::NotSupported();
+        [&](const std::string& src_dirname, const std::string& fname,
+            FileType,
+            const std::string& checksum_func_name,
+            const std::string& checksum_val) {
+          Status st;
+          uint64_t size_bytes = 0;
+          if (checksum_func_name == kUnknownFileChecksumFuncName ||
+              checksum_val == kUnknownFileChecksum)
+            return Status::NotSupported();
+          st = db_env_->GetFileSize(src_dirname + fname, &size_bytes);
+          if (!st.ok()) return st;
+
+          std::string dst_relative = fname.substr(1);
+          dst_relative = GetPrivateFileRel(new_backup_id, false, dst_relative);
+          std::string final_dest_path = GetAbsolutePath(dst_relative);
+          live_dst_paths.insert(final_dest_path);
+
+          std::promise<CopyOrCreateResult> promise_result;
+          st = backup_env_->LinkFile(src_dirname + fname,
+                                 final_dest_path);
+          if (st.ok()) {
+            BackupAfterCopyOrCreateWorkItem after_copy_or_create_work_item(
+              promise_result.get_future(), false, false, backup_env_,
+              "", final_dest_path, dst_relative);
+            backup_items_to_finish.push_back(std::move(after_copy_or_create_work_item));
+            CopyOrCreateResult result;
+            result.status = st;
+            result.size = size_bytes;
+            result.checksum_hex = ChecksumStrToHex(checksum_val);
+            promise_result.set_value(std::move(result));
+          }
+          return st;
         } /* link_file_cb */,
         [&](const std::string& src_dirname, const std::string& fname,
             uint64_t size_limit_bytes, FileType type,
@@ -1362,7 +1389,8 @@ Status BackupEngineImpl::CreateNewBackupWithMetadata(
               options.progress_callback, contents);
         } /* create_file_cb */,
         &sequence_number, options.flush_before_backup ? 0 : port::kMaxUint64,
-        compare_checksum);
+        compare_checksum,
+        options.consistentPointCallback);
     if (s.ok()) {
       new_backup->SetSequenceNumber(sequence_number);
     }
@@ -1373,9 +1401,15 @@ Status BackupEngineImpl::CreateNewBackupWithMetadata(
     item.result.wait();
     auto result = item.result.get();
     item_status = result.status;
-    if (item_status.ok() && item.shared && item.needed_to_copy) {
-      item_status =
-          item.backup_env->RenameFile(item.dst_path_tmp, item.dst_path);
+    if (item_status.ok()) {
+      if (item.shared && item.needed_to_copy) {
+          item_status =
+              item.backup_env->RenameFile(item.dst_path_tmp, item.dst_path);
+      } else {
+          // In current implementation, object upload are triggered by rename ops.
+          item_status =
+              item.backup_env->RenameFile(item.dst_path, item.dst_path);
+      }
     }
     if (item_status.ok()) {
       item_status = new_backup.get()->AddFile(std::make_shared<FileInfo>(

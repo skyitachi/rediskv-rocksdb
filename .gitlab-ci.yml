@@ -1,0 +1,24 @@
+stages:
+    - build
+
+debugJob:
+    stage: build
+    image: projecteru2/cli
+    only:
+        refs:
+            - test-not-used-now
+        #variables:
+        #    - $CI_PROJECT_NAMESPACE == "shopee/cloud"
+    script:
+        - DEBUG=1 BUILD_TYPE=Debug ./gen_spec.sh
+        - eru-cli image build --tag debug --name rocksdb ./spec.yaml
+
+releaseJob:
+    stage: build
+    image: projecteru2/cli
+    only:
+        refs:
+            - tags
+    script:
+        - DEBUG=0 BUILD_TYPE=Release ./gen_spec.sh
+        - eru-cli image build --tag ${CI_COMMIT_TAG} --name rocksdb ./spec.yaml

@@ -46,6 +46,8 @@
 #include "rocksdb/utilities/write_batch_with_index.h"
 #include "rocksdb/write_batch.h"
 #include "utilities/merge_operators.h"
+#include "rocksdb/sst_file_manager.h"
+#include "s3/env_s3.h"
 
 using ROCKSDB_NAMESPACE::BackupableDBOptions;
 using ROCKSDB_NAMESPACE::BackupEngine;
@@ -105,6 +107,7 @@ using ROCKSDB_NAMESPACE::Slice;
 using ROCKSDB_NAMESPACE::SliceParts;
 using ROCKSDB_NAMESPACE::SliceTransform;
 using ROCKSDB_NAMESPACE::Snapshot;
+using ROCKSDB_NAMESPACE::SstFileManager;
 using ROCKSDB_NAMESPACE::SstFileWriter;
 using ROCKSDB_NAMESPACE::Status;
 using ROCKSDB_NAMESPACE::TablePropertiesCollectorFactory;
@@ -121,6 +124,7 @@ using ROCKSDB_NAMESPACE::WriteOptions;
 
 using std::vector;
 using std::unordered_set;
+using s3::S3Util;
 
 extern "C" {
 
@@ -585,10 +589,22 @@ void rocksdb_backup_engine_create_new_backup_flush(rocksdb_backup_engine_t* be,
   SaveError(errptr, be->rep->CreateNewBackup(db->rep, flush_before_backup));
 }
 
+void rocksdb_backup_engine_create_new_backup_with_sequence(rocksdb_backup_engine_t* be,
+                                                           rocksdb_t* db,
+                                                           int(*consistentPointCallback)(),
+                                                           char** errptr) {
+  SaveError(errptr, be->rep->CreateNewBackupWithSequence(db->rep, consistentPointCallback));
+}
+
 void rocksdb_backup_engine_purge_old_backups(rocksdb_backup_engine_t* be,
                                              uint32_t num_backups_to_keep,
                                              char** errptr) {
   SaveError(errptr, be->rep->PurgeOldBackups(num_backups_to_keep));
+}
+
+void rocksdb_backup_engine_delete_backup(
+    rocksdb_backup_engine_t* be, uint32_t backup_id, char** errptr) {
+  SaveError(errptr, be->rep->DeleteBackup(backup_id));
 }
 
 rocksdb_restore_options_t* rocksdb_restore_options_create() {
@@ -806,6 +822,15 @@ void rocksdb_checkpoint_create(rocksdb_checkpoint_t* checkpoint,
                                uint64_t log_size_for_flush, char** errptr) {
   SaveError(errptr, checkpoint->rep->CreateCheckpoint(
                         std::string(checkpoint_dir), log_size_for_flush));
+}
+
+void rocksdb_checkpoint_create_with_sequence(rocksdb_checkpoint_t* checkpoint,
+                                             const char* checkpoint_dir,
+                                             int(*consistentPointCallback)(),
+                                             char** errptr) {
+  SaveError(errptr, checkpoint->rep->CreateCheckpointWithSequence(
+                        std::string(checkpoint_dir),
+                        consistentPointCallback));
 }
 
 void rocksdb_checkpoint_object_destroy(rocksdb_checkpoint_t* checkpoint) {
@@ -1826,11 +1851,18 @@ class H : public WriteBatch::Handler {
   void* state_;
   void (*put_)(void*, const char* k, size_t klen, const char* v, size_t vlen);
   void (*deleted_)(void*, const char* k, size_t klen);
+  void (*logdata_)(void*, const char* d, size_t dlen);
   void Put(const Slice& key, const Slice& value) override {
-    (*put_)(state_, key.data(), key.size(), value.data(), value.size());
+    if (put_)
+      (*put_)(state_, key.data(), key.size(), value.data(), value.size());
   }
   void Delete(const Slice& key) override {
-    (*deleted_)(state_, key.data(), key.size());
+    if (deleted_)
+      (*deleted_)(state_, key.data(), key.size());
+  }
+  void LogData(const Slice& blob) override {
+    if (logdata_)
+      (*logdata_)(state_, blob.data(), blob.size());
   }
 };
 
@@ -1838,11 +1870,13 @@ void rocksdb_writebatch_iterate(
     rocksdb_writebatch_t* b,
     void* state,
     void (*put)(void*, const char* k, size_t klen, const char* v, size_t vlen),
-    void (*deleted)(void*, const char* k, size_t klen)) {
+    void (*deleted)(void*, const char* k, size_t klen),
+    void (*logdata)(void*, const char* d, size_t dlen)) {
   H handler;
   handler.state_ = state;
   handler.put_ = put;
   handler.deleted_ = deleted;
+  handler.logdata_ = logdata;
   b->rep.Iterate(&handler);
 }
 
@@ -2506,6 +2540,11 @@ void rocksdb_options_set_merge_operator(
 void rocksdb_options_set_create_if_missing(
     rocksdb_options_t* opt, unsigned char v) {
   opt->rep.create_if_missing = v;
+}
+
+void rocksdb_options_set_crc32_file_checksum(
+    rocksdb_options_t* opt){
+  opt->rep.file_checksum_gen_factory = ROCKSDB_NAMESPACE::GetFileChecksumGenCrc32cFactory();
 }
 
 unsigned char rocksdb_options_get_create_if_missing(rocksdb_options_t* opt) {
@@ -4347,6 +4386,29 @@ rocksdb_env_t* rocksdb_create_mem_env() {
   return result;
 }
 
+rocksdb_backup_engine_t* rocksdb_s3_backup_engine_open(
+    const rocksdb_options_t* options,
+    const char *endpoint, const char *access_id, const char* secret_key,
+    const char *bucket, const char *prefix, const char *local_path,
+    char** errptr) {
+  BackupEngine* be;
+  auto s3_util = S3Util::BuildS3Util(endpoint, access_id, secret_key, bucket);
+  Env* s3_env =
+      new ROCKSDB_NAMESPACE::S3Env(prefix, local_path, s3_util);
+
+  if (SaveError(errptr, BackupEngine::Open(options->rep.env,
+          BackupableDBOptions(prefix,
+                              s3_env,
+                              true,
+                              options->rep.info_log.get()),
+                              &be))) {
+    return nullptr;
+  }
+  rocksdb_backup_engine_t* result = new rocksdb_backup_engine_t;
+  result->rep = be;
+  return result;
+}
+
 void rocksdb_env_set_background_threads(rocksdb_env_t* env, int n) {
   env->rep->SetBackgroundThreads(n);
 }
@@ -5505,6 +5567,17 @@ void rocksdb_approximate_memory_usage_destroy(rocksdb_memory_usage_t* usage) {
 
 void rocksdb_cancel_all_background_work(rocksdb_t* db, unsigned char wait) {
   CancelAllBackgroundWork(db->rep, wait);
+}
+
+uint64_t rocksdb_get_total_size(rocksdb_t *db) {
+  auto options = db->rep->GetOptions();
+  auto sfm = options.sst_file_manager.get();
+  return sfm->GetTotalSize();
+}
+
+void rocksdb_options_wal_readahead_size(
+    rocksdb_options_t* opt, size_t s) {
+  opt->rep.log_readahead_size = s;
 }
 
 }  // end extern "C"

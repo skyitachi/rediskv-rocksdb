@@ -255,6 +255,8 @@ struct CreateBackupOptions {
   // Callback for reporting progress, based on callback_trigger_interval_size.
   std::function<void()> progress_callback = []() {};
 
+  std::function<int()> consistentPointCallback = nullptr;
+
   // If false, background_thread_cpu_priority is ignored.
   // Otherwise, the cpu priority can be decreased,
   // if you try to increase the priority, the priority will not change.
@@ -479,6 +481,13 @@ class BackupEngineAppendOnlyBase {
     CreateBackupOptions options;
     options.flush_before_backup = flush_before_backup;
     options.progress_callback = progress_callback;
+    return CreateNewBackup(options, db);
+  }
+
+  virtual Status CreateNewBackupWithSequence(DB* db,
+                                             std::function<int()> consistentPointCallback) {
+    CreateBackupOptions options;
+    options.consistentPointCallback = consistentPointCallback;
     return CreateNewBackup(options, db);
   }
 
