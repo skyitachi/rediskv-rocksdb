@@ -378,7 +378,7 @@ Status CheckpointImpl::CreateCustomCheckpoint(
     // * for kTableFile/kBlobFile, attempt hard link instead of copy.
     // * but can't hard link across filesystems.
     if (same_fs) {
-      s = link_file_cb(db_->GetName(), src_fname, kTableFile, checksum_name,
+      s = link_file_cb(db_->GetName(), src_fname, type, checksum_name,
                        checksum_value);
       if (s.IsNotSupported()) {
         same_fs = false;
