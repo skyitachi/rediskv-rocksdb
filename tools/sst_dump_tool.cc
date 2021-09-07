@@ -37,7 +37,10 @@ void print_help(bool to_stderr) {
       Path to SST file or directory containing SST files
 
     --env_uri=<uri of underlying Env>
-      URI of underlying Env
+      URI of underlying Env, mutually exclusive with fs_uri
+
+    --fs_uri=<uri of underlying FileSystem>
+      URI of underlying FileSystem, mutually exclusive with env_uri
 
     --command=check|scan|raw|verify|identify
         check: Iterate over entries in files but don't print anything except if an error is encountered (default command)
@@ -130,7 +133,7 @@ bool ParseIntArg(const char* arg, const std::string arg_name,
 }  // namespace
 
 int SSTDumpTool::Run(int argc, char const* const* argv, Options options) {
-  const char* env_uri = nullptr;
+  std::string env_uri, fs_uri;
   const char* dir_or_file = nullptr;
   uint64_t read_num = std::numeric_limits<uint64_t>::max();
   std::string command;
@@ -177,6 +180,8 @@ int SSTDumpTool::Run(int argc, char const* const* argv, Options options) {
   for (int i = 1; i < argc; i++) {
     if (strncmp(argv[i], "--env_uri=", 10) == 0) {
       env_uri = argv[i] + 10;
+    } else if (strncmp(argv[i], "--fs_uri=", 9) == 0) {
+      fs_uri = argv[i] + 9;
     } else if (strncmp(argv[i], "--file=", 7) == 0) {
       dir_or_file = argv[i] + 7;
     } else if (strcmp(argv[i], "--output_hex") == 0) {
@@ -339,18 +344,19 @@ int SSTDumpTool::Run(int argc, char const* const* argv, Options options) {
   std::shared_ptr<ROCKSDB_NAMESPACE::Env> env_guard;
 
   // If caller of SSTDumpTool::Run(...) does not specify a different env other
-  // than Env::Default(), then try to load custom env based on dir_or_file.
+  // than Env::Default(), then try to load custom env based on env_uri/fs_uri.
   // Otherwise, the caller is responsible for creating custom env.
-  if (!options.env || options.env == ROCKSDB_NAMESPACE::Env::Default()) {
-    Env* env = Env::Default();
-    Status s = Env::LoadEnv(env_uri ? env_uri : "", &env, &env_guard);
-    if (!s.ok() && !s.IsNotFound()) {
-      fprintf(stderr, "LoadEnv: %s\n", s.ToString().c_str());
+  {
+    ConfigOptions config_options;
+    config_options.env = options.env;
+    Status s = Env::CreateFromUri(config_options, env_uri, fs_uri, &options.env,
+                                  &env_guard);
+    if (!s.ok()) {
+      fprintf(stderr, "CreateEnvFromUri: %s\n", s.ToString().c_str());
       exit(1);
+    } else {
+      fprintf(stdout, "options.env is %p\n", options.env);
     }
-    options.env = env;
-  } else {
-    fprintf(stdout, "options.env is %p\n", options.env);
   }
 
   std::vector<std::string> filenames;

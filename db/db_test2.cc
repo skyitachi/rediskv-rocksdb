@@ -9,6 +9,7 @@
 #include <atomic>
 #include <cstdlib>
 #include <functional>
+#include <memory>
 
 #include "db/db_test_util.h"
 #include "db/read_callback.h"
@@ -154,8 +155,14 @@ class PartitionedIndexTestListener : public EventListener {
 };
 
 TEST_F(DBTest2, PartitionedIndexUserToInternalKey) {
+  const int kValueSize = 10500;
+  const int kNumEntriesPerFile = 1000;
+  const int kNumFiles = 3;
+  const int kNumDistinctKeys = 30;
+
   BlockBasedTableOptions table_options;
   Options options = CurrentOptions();
+  options.disable_auto_compactions = true;
   table_options.index_type = BlockBasedTableOptions::kTwoLevelIndexSearch;
   PartitionedIndexTestListener* listener = new PartitionedIndexTestListener();
   options.table_factory.reset(NewBlockBasedTableFactory(table_options));
@@ -164,14 +171,15 @@ TEST_F(DBTest2, PartitionedIndexUserToInternalKey) {
   Reopen(options);
   Random rnd(301);
 
-  for (int i = 0; i < 3000; i++) {
-    int j = i % 30;
-    std::string value = rnd.RandomString(10500);
-    ASSERT_OK(Put("keykey_" + std::to_string(j), value));
-    snapshots.push_back(db_->GetSnapshot());
+  for (int i = 0; i < kNumFiles; i++) {
+    for (int j = 0; j < kNumEntriesPerFile; j++) {
+      int key_id = (i * kNumEntriesPerFile + j) % kNumDistinctKeys;
+      std::string value = rnd.RandomString(kValueSize);
+      ASSERT_OK(Put("keykey_" + std::to_string(key_id), value));
+      snapshots.push_back(db_->GetSnapshot());
+    }
+    ASSERT_OK(Flush());
   }
-  ASSERT_OK(Flush());
-  dbfull()->TEST_WaitForFlushMemTable();
 
   for (auto s : snapshots) {
     db_->ReleaseSnapshot(s);
@@ -337,6 +345,10 @@ class DBTestSharedWriteBufferAcrossCFs
 TEST_P(DBTestSharedWriteBufferAcrossCFs, SharedWriteBufferAcrossCFs) {
   Options options = CurrentOptions();
   options.arena_block_size = 4096;
+  auto flush_listener = std::make_shared<FlushCounterListener>();
+  options.listeners.push_back(flush_listener);
+  // Don't trip the listener at shutdown.
+  options.avoid_flush_during_shutdown = true;
 
   // Avoid undeterministic value by malloc_usable_size();
   // Force arena block size to 1
@@ -380,6 +392,7 @@ TEST_P(DBTestSharedWriteBufferAcrossCFs, SharedWriteBufferAcrossCFs) {
 
   // Create some data and flush "default" and "nikitich" so that they
   // are newer CFs created.
+  flush_listener->expected_flush_reason = FlushReason::kManualFlush;
   ASSERT_OK(Put(3, Key(1), DummyString(1), wo));
   Flush(3);
   ASSERT_OK(Put(3, Key(1), DummyString(1), wo));
@@ -390,6 +403,7 @@ TEST_P(DBTestSharedWriteBufferAcrossCFs, SharedWriteBufferAcrossCFs) {
   ASSERT_EQ(GetNumberOfSstFilesForColumnFamily(db_, "nikitich"),
             static_cast<uint64_t>(1));
 
+  flush_listener->expected_flush_reason = FlushReason::kWriteBufferManager;
   ASSERT_OK(Put(3, Key(1), DummyString(30000), wo));
   if (cost_cache_) {
     ASSERT_GE(cache->GetUsage(), 256 * 1024);
@@ -514,6 +528,10 @@ TEST_F(DBTest2, SharedWriteBufferLimitAcrossDB) {
   std::string dbname2 = test::PerThreadDBPath("db_shared_wb_db2");
   Options options = CurrentOptions();
   options.arena_block_size = 4096;
+  auto flush_listener = std::make_shared<FlushCounterListener>();
+  options.listeners.push_back(flush_listener);
+  // Don't trip the listener at shutdown.
+  options.avoid_flush_during_shutdown = true;
   // Avoid undeterministic value by malloc_usable_size();
   // Force arena block size to 1
   ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->SetCallBack(
@@ -551,6 +569,7 @@ TEST_F(DBTest2, SharedWriteBufferLimitAcrossDB) {
   };
 
   // Trigger a flush on cf2
+  flush_listener->expected_flush_reason = FlushReason::kWriteBufferManager;
   ASSERT_OK(Put(2, Key(1), DummyString(70000), wo));
   wait_flush();
   ASSERT_OK(Put(0, Key(1), DummyString(20000), wo));
@@ -3183,6 +3202,350 @@ TEST_F(DBTest2, PausingManualCompaction4) {
   ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->DisableProcessing();
 }
 
+TEST_F(DBTest2, CancelManualCompaction1) {
+  CompactRangeOptions compact_options;
+  auto canceledPtr =
+      std::unique_ptr<std::atomic<bool>>(new std::atomic<bool>{true});
+  compact_options.canceled = canceledPtr.get();
+
+  Options options = CurrentOptions();
+  options.disable_auto_compactions = true;
+  options.num_levels = 7;
+
+  Random rnd(301);
+  auto generate_files = [&]() {
+    for (int i = 0; i < options.num_levels; i++) {
+      for (int j = 0; j < options.num_levels - i + 1; j++) {
+        for (int k = 0; k < 1000; k++) {
+          ASSERT_OK(Put(Key(k + j * 1000), rnd.RandomString(50)));
+        }
+        Flush();
+      }
+
+      for (int l = 1; l < options.num_levels - i; l++) {
+        MoveFilesToLevel(l);
+      }
+    }
+  };
+
+  DestroyAndReopen(options);
+  generate_files();
+#ifndef ROCKSDB_LITE
+  ASSERT_EQ("2,3,4,5,6,7,8", FilesPerLevel());
+#endif  // !ROCKSDB_LITE
+
+  int run_manual_compactions = 0;
+  ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->SetCallBack(
+      "CompactionJob::Run():PausingManualCompaction:1",
+      [&](void* /*arg*/) { run_manual_compactions++; });
+  ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->EnableProcessing();
+
+  // Setup a callback to disable compactions after a couple of levels are
+  // compacted
+  int compactions_run = 0;
+  ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->SetCallBack(
+      "DBImpl::RunManualCompaction()::1",
+      [&](void* /*arg*/) { ++compactions_run; });
+
+  dbfull()->CompactRange(compact_options, nullptr, nullptr);
+  dbfull()->TEST_WaitForCompact(true);
+
+  // Since compactions are disabled, we shouldn't start compacting.
+  // E.g. we should call the compaction function exactly one time.
+  ASSERT_EQ(compactions_run, 0);
+  ASSERT_EQ(run_manual_compactions, 0);
+#ifndef ROCKSDB_LITE
+  ASSERT_EQ("2,3,4,5,6,7,8", FilesPerLevel());
+#endif  // !ROCKSDB_LITE
+
+  compactions_run = 0;
+  ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->ClearCallBack(
+      "DBImpl::RunManualCompaction()::1");
+  ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->SetCallBack(
+      "DBImpl::RunManualCompaction()::1", [&](void* /*arg*/) {
+        ++compactions_run;
+        // After 3 compactions disable
+        if (compactions_run == 3) {
+          compact_options.canceled->store(true, std::memory_order_release);
+        }
+      });
+
+  compact_options.canceled->store(false, std::memory_order_release);
+  dbfull()->CompactRange(compact_options, nullptr, nullptr);
+  dbfull()->TEST_WaitForCompact(true);
+
+  ASSERT_EQ(compactions_run, 3);
+
+  ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->ClearCallBack(
+      "DBImpl::RunManualCompaction()::1");
+  ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->ClearCallBack(
+      "CompactionJob::Run():PausingManualCompaction:1");
+
+  // Compactions should work again if we re-enable them..
+  compact_options.canceled->store(false, std::memory_order_relaxed);
+  dbfull()->CompactRange(compact_options, nullptr, nullptr);
+  dbfull()->TEST_WaitForCompact(true);
+#ifndef ROCKSDB_LITE
+  ASSERT_EQ("0,0,0,0,0,0,2", FilesPerLevel());
+#endif  // !ROCKSDB_LITE
+
+  ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->DisableProcessing();
+}
+
+TEST_F(DBTest2, CancelManualCompaction2) {
+  CompactRangeOptions compact_options;
+  auto canceledPtr =
+      std::unique_ptr<std::atomic<bool>>(new std::atomic<bool>{true});
+  compact_options.canceled = canceledPtr.get();
+  compact_options.max_subcompactions = 1;
+
+  Options options = CurrentOptions();
+  options.disable_auto_compactions = true;
+  options.num_levels = 7;
+
+  Random rnd(301);
+  auto generate_files = [&]() {
+    for (int i = 0; i < options.num_levels; i++) {
+      for (int j = 0; j < options.num_levels - i + 1; j++) {
+        for (int k = 0; k < 1000; k++) {
+          ASSERT_OK(Put(Key(k + j * 1000), rnd.RandomString(50)));
+        }
+        Flush();
+      }
+
+      for (int l = 1; l < options.num_levels - i; l++) {
+        MoveFilesToLevel(l);
+      }
+    }
+  };
+
+  DestroyAndReopen(options);
+  generate_files();
+#ifndef ROCKSDB_LITE
+  ASSERT_EQ("2,3,4,5,6,7,8", FilesPerLevel());
+#endif  // !ROCKSDB_LITE
+
+  ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->EnableProcessing();
+
+  int compactions_run = 0;
+  std::atomic<int> kv_compactions{0};
+  int compactions_stopped_at = 0;
+  int kv_compactions_stopped_at = 0;
+  ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->SetCallBack(
+      "DBImpl::RunManualCompaction()::1", [&](void* /*arg*/) {
+        ++compactions_run;
+        // After 3 compactions disable
+      });
+
+  ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->SetCallBack(
+      "CompactionIterator:ProcessKV", [&](void* /*arg*/) {
+        int kv_compactions_run =
+            kv_compactions.fetch_add(1, std::memory_order_release);
+        if (kv_compactions_run == 5) {
+          compact_options.canceled->store(true, std::memory_order_release);
+          kv_compactions_stopped_at = kv_compactions_run;
+          compactions_stopped_at = compactions_run;
+        }
+      });
+
+  compact_options.canceled->store(false, std::memory_order_release);
+  dbfull()->CompactRange(compact_options, nullptr, nullptr);
+  dbfull()->TEST_WaitForCompact(true);
+
+  // NOTE: as we set compact_options.max_subcompacitons = 1, and store true to
+  // the canceled variable from the single compacting thread (via callback),
+  // this value is deterministically kv_compactions_stopped_at + 1.
+  ASSERT_EQ(kv_compactions, kv_compactions_stopped_at + 1);
+  ASSERT_EQ(compactions_run, compactions_stopped_at);
+
+  ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->ClearCallBack(
+      "CompactionIterator::ProcessKV");
+  ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->ClearCallBack(
+      "DBImpl::RunManualCompaction()::1");
+  ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->ClearCallBack(
+      "CompactionJob::Run():PausingManualCompaction:1");
+
+  // Compactions should work again if we re-enable them..
+  compact_options.canceled->store(false, std::memory_order_relaxed);
+  dbfull()->CompactRange(compact_options, nullptr, nullptr);
+  dbfull()->TEST_WaitForCompact(true);
+#ifndef ROCKSDB_LITE
+  ASSERT_EQ("0,0,0,0,0,0,2", FilesPerLevel());
+#endif  // !ROCKSDB_LITE
+
+  ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->DisableProcessing();
+}
+
+class CancelCompactionListener : public EventListener {
+ public:
+  CancelCompactionListener()
+      : num_compaction_started_(0), num_compaction_ended_(0) {}
+
+  void OnCompactionBegin(DB* /*db*/, const CompactionJobInfo& ci) override {
+    ASSERT_EQ(ci.cf_name, "default");
+    ASSERT_EQ(ci.base_input_level, 0);
+    num_compaction_started_++;
+  }
+
+  void OnCompactionCompleted(DB* /*db*/, const CompactionJobInfo& ci) override {
+    ASSERT_EQ(ci.cf_name, "default");
+    ASSERT_EQ(ci.base_input_level, 0);
+    ASSERT_EQ(ci.status.code(), code_);
+    ASSERT_EQ(ci.status.subcode(), subcode_);
+    num_compaction_ended_++;
+  }
+
+  std::atomic<size_t> num_compaction_started_;
+  std::atomic<size_t> num_compaction_ended_;
+  Status::Code code_;
+  Status::SubCode subcode_;
+};
+
+TEST_F(DBTest2, CancelManualCompactionWithListener) {
+  CompactRangeOptions compact_options;
+  auto canceledPtr =
+      std::unique_ptr<std::atomic<bool>>(new std::atomic<bool>{true});
+  compact_options.canceled = canceledPtr.get();
+  compact_options.max_subcompactions = 1;
+
+  Options options = CurrentOptions();
+  options.disable_auto_compactions = true;
+  CancelCompactionListener* listener = new CancelCompactionListener();
+  options.listeners.emplace_back(listener);
+
+  DestroyAndReopen(options);
+
+  Random rnd(301);
+  for (int i = 0; i < 10; i++) {
+    for (int j = 0; j < 10; j++) {
+      ASSERT_OK(Put(Key(i + j * 10), rnd.RandomString(50)));
+    }
+    Flush();
+  }
+
+  ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->EnableProcessing();
+
+  ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->SetCallBack(
+      "CompactionIterator:ProcessKV", [&](void* /*arg*/) {
+        compact_options.canceled->store(true, std::memory_order_release);
+      });
+
+  int running_compaction = 0;
+  ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->SetCallBack(
+      "CompactionJob::FinishCompactionOutputFile1",
+      [&](void* /*arg*/) { running_compaction++; });
+
+  // Case I: 1 Notify begin compaction, 2 DisableManualCompaction, 3 Compaction
+  // not run, 4 Notify compaction end.
+  listener->code_ = Status::kIncomplete;
+  listener->subcode_ = Status::SubCode::kManualCompactionPaused;
+
+  compact_options.canceled->store(false, std::memory_order_release);
+  dbfull()->CompactRange(compact_options, nullptr, nullptr);
+  dbfull()->TEST_WaitForCompact(true);
+
+  ASSERT_GT(listener->num_compaction_started_, 0);
+  ASSERT_EQ(listener->num_compaction_started_, listener->num_compaction_ended_);
+  ASSERT_EQ(running_compaction, 0);
+
+  listener->num_compaction_started_ = 0;
+  listener->num_compaction_ended_ = 0;
+
+  // Case II: 1 DisableManualCompaction, 2 Notify begin compaction (return
+  // without notifying), 3 Notify compaction end (return without notifying).
+  dbfull()->CompactRange(compact_options, nullptr, nullptr);
+  dbfull()->TEST_WaitForCompact(true);
+
+  ASSERT_EQ(listener->num_compaction_started_, 0);
+  ASSERT_EQ(listener->num_compaction_started_, listener->num_compaction_ended_);
+  ASSERT_EQ(running_compaction, 0);
+
+  // Case III: 1 Notify begin compaction, 2 Compaction in between
+  // 3. DisableManualCompaction, , 4 Notify compaction end.
+  // compact_options.canceled->store(false, std::memory_order_release);
+  ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->ClearCallBack(
+      "CompactionIterator:ProcessKV");
+
+  ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->SetCallBack(
+      "CompactionJob::Run:BeforeVerify", [&](void* /*arg*/) {
+        compact_options.canceled->store(true, std::memory_order_release);
+      });
+
+  listener->code_ = Status::kOk;
+  listener->subcode_ = Status::SubCode::kNone;
+
+  compact_options.canceled->store(false, std::memory_order_release);
+  dbfull()->CompactRange(compact_options, nullptr, nullptr);
+  dbfull()->TEST_WaitForCompact(true);
+
+  ASSERT_GT(listener->num_compaction_started_, 0);
+  ASSERT_EQ(listener->num_compaction_started_, listener->num_compaction_ended_);
+
+  // Compaction job will succeed.
+  ASSERT_GT(running_compaction, 0);
+
+  ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->ClearAllCallBacks();
+  ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->DisableProcessing();
+}
+
+TEST_F(DBTest2, CompactionOnBottomPriorityWithListener) {
+  int num_levels = 3;
+  const int kNumFilesTrigger = 4;
+
+  Options options = CurrentOptions();
+  env_->SetBackgroundThreads(0, Env::Priority::HIGH);
+  env_->SetBackgroundThreads(0, Env::Priority::LOW);
+  env_->SetBackgroundThreads(1, Env::Priority::BOTTOM);
+  options.env = env_;
+  options.compaction_style = kCompactionStyleUniversal;
+  options.num_levels = num_levels;
+  options.write_buffer_size = 100 << 10;     // 100KB
+  options.target_file_size_base = 32 << 10;  // 32KB
+  options.level0_file_num_compaction_trigger = kNumFilesTrigger;
+  // Trigger compaction if size amplification exceeds 110%
+  options.compaction_options_universal.max_size_amplification_percent = 110;
+
+  CancelCompactionListener* listener = new CancelCompactionListener();
+  options.listeners.emplace_back(listener);
+
+  DestroyAndReopen(options);
+
+  int num_bottom_thread_compaction_scheduled = 0;
+  ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->EnableProcessing();
+
+  ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->SetCallBack(
+      "DBImpl::BackgroundCompaction:ForwardToBottomPriPool",
+      [&](void* /*arg*/) { num_bottom_thread_compaction_scheduled++; });
+
+  int num_compaction_jobs = 0;
+  ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->SetCallBack(
+      "CompactionJob::Run():End",
+      [&](void* /*arg*/) { num_compaction_jobs++; });
+
+  listener->code_ = Status::kOk;
+  listener->subcode_ = Status::SubCode::kNone;
+
+  Random rnd(301);
+  for (int i = 0; i < 1; ++i) {
+    for (int num = 0; num < kNumFilesTrigger; num++) {
+      int key_idx = 0;
+      GenerateNewFile(&rnd, &key_idx, true /* no_wait */);
+      // use no_wait above because that one waits for flush and compaction. We
+      // don't want to wait for compaction because the full compaction is
+      // intentionally blocked while more files are flushed.
+      ASSERT_OK(dbfull()->TEST_WaitForFlushMemTable());
+    }
+  }
+  ASSERT_OK(dbfull()->TEST_WaitForCompact());
+  ASSERT_GT(num_bottom_thread_compaction_scheduled, 0);
+  ASSERT_EQ(num_compaction_jobs, 1);
+  ASSERT_GT(listener->num_compaction_started_, 0);
+  ASSERT_EQ(listener->num_compaction_started_, listener->num_compaction_ended_);
+
+  ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->ClearAllCallBacks();
+  ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->DisableProcessing();
+}
+
 TEST_F(DBTest2, OptimizeForPointLookup) {
   Options options = CurrentOptions();
   Close();
@@ -4109,7 +4472,7 @@ TEST_F(DBTest2, TraceWithFilter) {
 
   // Open another db, replay, and verify the data
   std::string value;
-  std::string dbname2 = test::TmpDir(env_) + "/db_replay";
+  std::string dbname2 = test::PerThreadDBPath(env_, "db_replay");
   ASSERT_OK(DestroyDB(dbname2, options));
 
   // Using a different name than db2, to pacify infer's use-after-lifetime
@@ -4160,7 +4523,7 @@ TEST_F(DBTest2, TraceWithFilter) {
   ASSERT_OK(DestroyDB(dbname2, options));
 
   // Set up a new db.
-  std::string dbname3 = test::TmpDir(env_) + "/db_not_trace_read";
+  std::string dbname3 = test::PerThreadDBPath(env_, "db_not_trace_read");
   ASSERT_OK(DestroyDB(dbname3, options));
 
   DB* db3_init = nullptr;
@@ -4577,7 +4940,7 @@ TEST_F(DBTest2, MultiDBParallelOpenTest) {
   Options options = CurrentOptions();
   std::vector<std::string> dbnames;
   for (int i = 0; i < kNumDbs; ++i) {
-    dbnames.emplace_back(test::TmpDir(env_) + "/db" + ToString(i));
+    dbnames.emplace_back(test::PerThreadDBPath(env_, "db" + ToString(i)));
     ASSERT_OK(DestroyDB(dbnames.back(), options));
   }
 
@@ -4970,7 +5333,7 @@ TEST_F(DBTest2, SameSmallestInSameLevel) {
   ASSERT_OK(Put("key", "2"));
   ASSERT_OK(db_->Merge(WriteOptions(), "key", "3"));
   ASSERT_OK(db_->Merge(WriteOptions(), "key", "4"));
-  Flush();
+  ASSERT_OK(Flush());
   CompactRangeOptions cro;
   cro.change_level = true;
   cro.target_level = 2;
@@ -5421,6 +5784,120 @@ TEST_F(DBTest2, AutoPrefixMode1) {
     ASSERT_EQ("a1", iterator->key().ToString());
   }
 }
+
+class RenameCurrentTest : public DBTestBase,
+                          public testing::WithParamInterface<std::string> {
+ public:
+  RenameCurrentTest()
+      : DBTestBase("rename_current_test", /*env_do_fsync=*/true),
+        sync_point_(GetParam()) {}
+
+  ~RenameCurrentTest() override {}
+
+  void SetUp() override {
+    env_->no_file_overwrite_.store(true, std::memory_order_release);
+  }
+
+  void TearDown() override {
+    env_->no_file_overwrite_.store(false, std::memory_order_release);
+  }
+
+  void SetupSyncPoints() {
+    SyncPoint::GetInstance()->DisableProcessing();
+    SyncPoint::GetInstance()->SetCallBack(sync_point_, [&](void* arg) {
+      Status* s = reinterpret_cast<Status*>(arg);
+      assert(s);
+      *s = Status::IOError("Injected IO error.");
+    });
+  }
+
+  const std::string sync_point_;
+};
+
+INSTANTIATE_TEST_CASE_P(DistributedFS, RenameCurrentTest,
+                        ::testing::Values("SetCurrentFile:BeforeRename",
+                                          "SetCurrentFile:AfterRename"));
+
+TEST_P(RenameCurrentTest, Open) {
+  Destroy(last_options_);
+  Options options = GetDefaultOptions();
+  options.create_if_missing = true;
+  SetupSyncPoints();
+  SyncPoint::GetInstance()->EnableProcessing();
+  Status s = TryReopen(options);
+  ASSERT_NOK(s);
+
+  SyncPoint::GetInstance()->DisableProcessing();
+  Reopen(options);
+}
+
+TEST_P(RenameCurrentTest, Flush) {
+  Destroy(last_options_);
+  Options options = GetDefaultOptions();
+  options.max_manifest_file_size = 1;
+  options.create_if_missing = true;
+  Reopen(options);
+  ASSERT_OK(Put("key", "value"));
+  SetupSyncPoints();
+  SyncPoint::GetInstance()->EnableProcessing();
+  ASSERT_NOK(Flush());
+
+  ASSERT_NOK(Put("foo", "value"));
+
+  SyncPoint::GetInstance()->DisableProcessing();
+  Reopen(options);
+  ASSERT_EQ("value", Get("key"));
+  ASSERT_EQ("NOT_FOUND", Get("foo"));
+}
+
+TEST_P(RenameCurrentTest, Compaction) {
+  Destroy(last_options_);
+  Options options = GetDefaultOptions();
+  options.max_manifest_file_size = 1;
+  options.create_if_missing = true;
+  Reopen(options);
+  ASSERT_OK(Put("a", "a_value"));
+  ASSERT_OK(Put("c", "c_value"));
+  ASSERT_OK(Flush());
+
+  ASSERT_OK(Put("b", "b_value"));
+  ASSERT_OK(Put("d", "d_value"));
+  ASSERT_OK(Flush());
+
+  SetupSyncPoints();
+  SyncPoint::GetInstance()->EnableProcessing();
+  ASSERT_NOK(db_->CompactRange(CompactRangeOptions(), /*begin=*/nullptr,
+                               /*end=*/nullptr));
+
+  ASSERT_NOK(Put("foo", "value"));
+
+  SyncPoint::GetInstance()->DisableProcessing();
+  Reopen(options);
+  ASSERT_EQ("NOT_FOUND", Get("foo"));
+  ASSERT_EQ("d_value", Get("d"));
+}
+
+TEST_F(DBTest2, BottommostTemperature) {
+  Options options = CurrentOptions();
+  options.bottommost_temperature = Temperature::kWarm;
+  options.level0_file_num_compaction_trigger = 2;
+  Reopen(options);
+
+  ASSERT_OK(Put("foo", "bar"));
+  ASSERT_OK(Put("bar", "bar"));
+  ASSERT_OK(Flush());
+  ASSERT_OK(Put("foo", "bar"));
+  ASSERT_OK(Put("bar", "bar"));
+  ASSERT_OK(Flush());
+  ASSERT_OK(dbfull()->TEST_WaitForCompact());
+
+  Reopen(options);
+
+  ColumnFamilyMetaData metadata;
+  db_->GetColumnFamilyMetaData(&metadata);
+  ASSERT_EQ(1, metadata.file_count);
+  ASSERT_EQ(Temperature::kWarm, metadata.levels[1].files[0].temperature);
+}
 #endif  // ROCKSDB_LITE
 
 // WAL recovery mode is WALRecoveryMode::kPointInTimeRecovery.
@@ -5447,6 +5924,34 @@ TEST_F(DBTest2, PointInTimeRecoveryWithIOErrorWhileReadingWal) {
   options.wal_recovery_mode = WALRecoveryMode::kPointInTimeRecovery;
   Status s = TryReopen(options);
   ASSERT_TRUE(s.IsIOError());
+}
+
+TEST_F(DBTest2, PointInTimeRecoveryWithSyncFailureInCFCreation) {
+  ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->LoadDependency(
+      {{"DBImpl::BackgroundCallFlush:Start:1",
+        "PointInTimeRecoveryWithSyncFailureInCFCreation:1"},
+       {"PointInTimeRecoveryWithSyncFailureInCFCreation:2",
+        "DBImpl::BackgroundCallFlush:Start:2"}});
+  ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->EnableProcessing();
+
+  CreateColumnFamilies({"test1"}, Options());
+  ASSERT_OK(Put("foo", "bar"));
+
+  // Creating a CF when a flush is going on, log is synced but the
+  // closed log file is not synced and corrupted.
+  port::Thread flush_thread([&]() { ASSERT_NOK(Flush()); });
+  TEST_SYNC_POINT("PointInTimeRecoveryWithSyncFailureInCFCreation:1");
+  CreateColumnFamilies({"test2"}, Options());
+  env_->corrupt_in_sync_ = true;
+  TEST_SYNC_POINT("PointInTimeRecoveryWithSyncFailureInCFCreation:2");
+  flush_thread.join();
+  env_->corrupt_in_sync_ = false;
+  ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->DisableProcessing();
+
+  // Reopening the DB should not corrupt anything
+  Options options = CurrentOptions();
+  options.wal_recovery_mode = WALRecoveryMode::kPointInTimeRecovery;
+  ReopenWithColumnFamilies({"default", "test1", "test2"}, options);
 }
 }  // namespace ROCKSDB_NAMESPACE
 

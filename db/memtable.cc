@@ -43,7 +43,7 @@
 namespace ROCKSDB_NAMESPACE {
 
 ImmutableMemTableOptions::ImmutableMemTableOptions(
-    const ImmutableCFOptions& ioptions,
+    const ImmutableOptions& ioptions,
     const MutableCFOptions& mutable_cf_options)
     : arena_block_size(mutable_cf_options.arena_block_size),
       memtable_prefix_bloom_bits(
@@ -58,16 +58,17 @@ ImmutableMemTableOptions::ImmutableMemTableOptions(
       inplace_update_num_locks(mutable_cf_options.inplace_update_num_locks),
       inplace_callback(ioptions.inplace_callback),
       max_successive_merges(mutable_cf_options.max_successive_merges),
-      statistics(ioptions.statistics),
-      merge_operator(ioptions.merge_operator),
-      info_log(ioptions.info_log),
+      statistics(ioptions.stats),
+      merge_operator(ioptions.merge_operator.get()),
+      info_log(ioptions.logger),
       allow_data_in_errors(ioptions.allow_data_in_errors) {}
 
 MemTable::MemTable(const InternalKeyComparator& cmp,
-                   const ImmutableCFOptions& ioptions,
+                   const ImmutableOptions& ioptions,
                    const MutableCFOptions& mutable_cf_options,
                    WriteBufferManager* write_buffer_manager,
-                   SequenceNumber latest_seq, uint32_t column_family_id)
+                   SequenceNumber latest_seq, uint32_t column_family_id,
+                   uint64_t current_logfile_number)
     : comparator_(cmp),
       moptions_(ioptions, mutable_cf_options),
       refs_(0),
@@ -82,9 +83,9 @@ MemTable::MemTable(const InternalKeyComparator& cmp,
              mutable_cf_options.memtable_huge_page_size),
       table_(ioptions.memtable_factory->CreateMemTableRep(
           comparator_, &arena_, mutable_cf_options.prefix_extractor.get(),
-          ioptions.info_log, column_family_id)),
+          ioptions.logger, column_family_id)),
       range_del_table_(SkipListFactory().CreateMemTableRep(
-          comparator_, &arena_, nullptr /* transform */, ioptions.info_log,
+          comparator_, &arena_, nullptr /* transform */, ioptions.logger,
           column_family_id)),
       is_range_del_table_empty_(true),
       data_size_(0),
@@ -98,15 +99,16 @@ MemTable::MemTable(const InternalKeyComparator& cmp,
       earliest_seqno_(latest_seq),
       creation_seq_(latest_seq),
       mem_next_logfile_number_(0),
+      mem_min_logfile_number_(current_logfile_number),
       min_prep_log_referenced_(0),
       locks_(moptions_.inplace_update_support
                  ? moptions_.inplace_update_num_locks
                  : 0),
       prefix_extractor_(mutable_cf_options.prefix_extractor.get()),
       flush_state_(FLUSH_NOT_REQUESTED),
-      clock_(ioptions.env->GetSystemClock()),
+      clock_(ioptions.clock),
       insert_with_hint_prefix_extractor_(
-          ioptions.memtable_insert_with_hint_prefix_extractor),
+          ioptions.memtable_insert_with_hint_prefix_extractor.get()),
       oldest_key_time_(std::numeric_limits<uint64_t>::max()),
       atomic_flush_seqno_(kMaxSequenceNumber),
       approximate_memory_usage_(0) {
@@ -120,7 +122,7 @@ MemTable::MemTable(const InternalKeyComparator& cmp,
     bloom_filter_.reset(
         new DynamicBloom(&arena_, moptions_.memtable_prefix_bloom_bits,
                          6 /* hard coded 6 probes */,
-                         moptions_.memtable_huge_page_size, ioptions.info_log));
+                         moptions_.memtable_huge_page_size, ioptions.logger));
   }
 }
 
@@ -684,7 +686,7 @@ struct Saver {
   Statistics* statistics;
   bool inplace_update_support;
   bool do_merge;
-  std::shared_ptr<SystemClock> clock;
+  SystemClock* clock;
 
   ReadCallback* callback_;
   bool* is_blob_index;
@@ -723,8 +725,8 @@ static bool SaveValue(void* arg, const char* entry) {
   const Comparator* user_comparator =
       s->mem->GetInternalKeyComparator().user_comparator();
   size_t ts_sz = user_comparator->timestamp_size();
-  if (user_comparator->CompareWithoutTimestamp(user_key_slice,
-                                               s->key->user_key()) == 0) {
+  if (user_comparator->EqualWithoutTimestamp(user_key_slice,
+                                             s->key->user_key())) {
     // Correct user key
     const uint64_t tag = DecodeFixed64(key_ptr + key_length - 8);
     ValueType type;

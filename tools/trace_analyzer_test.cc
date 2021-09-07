@@ -12,7 +12,7 @@
 #include <cstdio>
 int main() {
   fprintf(stderr, "Please install gflags to run trace_analyzer test\n");
-  return 1;
+  return 0;
 }
 #else
 
@@ -23,7 +23,7 @@ int main() {
 #include <thread>
 
 #include "db/db_test_util.h"
-#include "file/read_write_util.h"
+#include "file/line_file_reader.h"
 #include "rocksdb/db.h"
 #include "rocksdb/env.h"
 #include "rocksdb/status.h"
@@ -81,8 +81,26 @@ class TraceAnalyzerTest : public testing::Test {
     ASSERT_OK(batch.SingleDelete("d"));
     ASSERT_OK(batch.DeleteRange("e", "f"));
     ASSERT_OK(db_->Write(wo, &batch));
-
+    std::vector<Slice> keys;
+    keys.push_back("a");
+    keys.push_back("b");
+    keys.push_back("df");
+    keys.push_back("gege");
+    keys.push_back("hjhjhj");
+    std::vector<std::string> values;
+    std::vector<Status> ss = db_->MultiGet(ro, keys, &values);
+    ASSERT_GE(ss.size(), 0);
+    ASSERT_OK(ss[0]);
+    ASSERT_NOK(ss[2]);
+    std::vector<ColumnFamilyHandle*> cfs(2, db_->DefaultColumnFamily());
+    std::vector<PinnableSlice> values2(keys.size());
+    db_->MultiGet(ro, 2, cfs.data(), keys.data(), values2.data(), ss.data(),
+                  false);
+    ASSERT_OK(ss[0]);
+    db_->MultiGet(ro, db_->DefaultColumnFamily(), 2, keys.data() + 3,
+                  values2.data(), ss.data(), false);
     ASSERT_OK(db_->Get(ro, "a", &value));
+
     single_iter = db_->NewIterator(ro);
     single_iter->Seek("a");
     ASSERT_OK(single_iter->status());
@@ -133,20 +151,16 @@ class TraceAnalyzerTest : public testing::Test {
     std::unique_ptr<FSSequentialFile> file;
     ASSERT_OK(fs->NewSequentialFile(file_path, fopts, &file, nullptr));
 
-    std::string get_line;
-    std::istringstream iss;
-    bool has_data = true;
-    std::vector<std::string> result;
-    uint32_t count;
-    Status s;
-    SequentialFileReader sf_reader(std::move(file), file_path,
-                                   4096 /* filereadahead_size */);
+    LineFileReader lf_reader(std::move(file), file_path,
+                             4096 /* filereadahead_size */);
 
-    for (count = 0; ReadOneLine(&iss, &sf_reader, &get_line, &has_data, &s);
-         ++count) {
-      ASSERT_OK(s);
-      result.push_back(get_line);
+    std::vector<std::string> result;
+    std::string line;
+    while (lf_reader.ReadLine(&line)) {
+      result.push_back(line);
     }
+
+    ASSERT_OK(lf_reader.GetStatus());
 
     ASSERT_EQ(cnt.size(), result.size());
     for (int i = 0; i < static_cast<int>(result.size()); i++) {

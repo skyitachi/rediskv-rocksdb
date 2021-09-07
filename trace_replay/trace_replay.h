@@ -59,6 +59,8 @@ enum TraceType : char {
   kBlockTraceRangeDeletionBlock = 11,
   // For IOTracing.
   kIOTracer = 12,
+  // For query tracing
+  kTraceMultiGet = 13,
   // All trace types should be added before kTraceMax
   kTraceMax,
 };
@@ -98,6 +100,9 @@ enum TracePayloadType : char {
   kIterKey = 5,
   kIterLowerBound = 6,
   kIterUpperBound = 7,
+  kMultiGetSize = 8,
+  kMultiGetCFIDs = 9,
+  kMultiGetKeys = 10,
 };
 
 struct WritePayload {
@@ -105,15 +110,21 @@ struct WritePayload {
 };
 
 struct GetPayload {
-  uint32_t cf_id;
+  uint32_t cf_id = 0;
   Slice get_key;
 };
 
 struct IterPayload {
-  uint32_t cf_id;
+  uint32_t cf_id = 0;
   Slice iter_key;
   Slice lower_bound;
   Slice upper_bound;
+};
+
+struct MultiGetPayload {
+  uint32_t multiget_size;
+  std::vector<uint32_t> cf_ids;
+  std::vector<std::string> multiget_keys;
 };
 
 class TracerHelper {
@@ -143,6 +154,10 @@ class TracerHelper {
 
   // Decode the iter payload and store in WrteiPayload
   static void DecodeIterPayload(Trace* trace, IterPayload* iter_payload);
+
+  // Decode the multiget payload and store in MultiGetPayload
+  static void DecodeMultiGetPayload(Trace* trace,
+                                    MultiGetPayload* multiget_payload);
 };
 
 // Tracer captures all RocksDB operations using a user-provided TraceWriter.
@@ -150,8 +165,7 @@ class TracerHelper {
 // timestamp and type, followed by the trace payload.
 class Tracer {
  public:
-  Tracer(const std::shared_ptr<SystemClock>& clock,
-         const TraceOptions& trace_options,
+  Tracer(SystemClock* clock, const TraceOptions& trace_options,
          std::unique_ptr<TraceWriter>&& trace_writer);
   ~Tracer();
 
@@ -166,6 +180,17 @@ class Tracer {
                       const Slice& lower_bound, const Slice upper_bound);
   Status IteratorSeekForPrev(const uint32_t& cf_id, const Slice& key,
                              const Slice& lower_bound, const Slice upper_bound);
+
+  // Trace MultiGet
+
+  Status MultiGet(const size_t num_keys, ColumnFamilyHandle** column_families,
+                  const Slice* keys);
+
+  Status MultiGet(const size_t num_keys, ColumnFamilyHandle* column_family,
+                  const Slice* keys);
+
+  Status MultiGet(const std::vector<ColumnFamilyHandle*>& column_family,
+                  const std::vector<Slice>& keys);
 
   // Returns true if the trace is over the configured max trace file limit.
   // False otherwise.
@@ -191,7 +216,7 @@ class Tracer {
   // Returns true if a trace should be skipped, false otherwise.
   bool ShouldSkipTrace(const TraceType& type);
 
-  std::shared_ptr<SystemClock> clock_;
+  SystemClock* clock_;
   TraceOptions trace_options_;
   std::unique_ptr<TraceWriter> trace_writer_;
   uint64_t trace_request_count_;

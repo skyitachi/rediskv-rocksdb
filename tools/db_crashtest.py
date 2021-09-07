@@ -61,6 +61,7 @@ default_params = {
     "enable_pipelined_write": lambda: random.randint(0, 1),
     "enable_compaction_filter": lambda: random.choice([0, 0, 0, 1]),
     "expected_values_path": lambda: setup_expected_values_file(),
+    "fail_if_options_file_error": lambda: random.randint(0, 1),
     "flush_one_in": 1000000,
     "file_checksum_impl": lambda: random.choice(["none", "crc32c", "xxh64", "big"]),
     "get_live_files_one_in": 1000000,
@@ -100,6 +101,7 @@ default_params = {
     "use_direct_reads": lambda: random.randint(0, 1),
     "use_direct_io_for_flush_and_compaction": lambda: random.randint(0, 1),
     "mock_direct_io": False,
+    "use_clock_cache": 0, # currently broken
     "use_full_merge_v1": lambda: random.randint(0, 1),
     "use_merge": lambda: random.randint(0, 1),
     "use_ribbon_filter": lambda: random.randint(0, 1),
@@ -137,16 +139,21 @@ default_params = {
     "max_key_len": 3,
     "key_len_percent_dist": "1,30,69",
     "read_fault_one_in": lambda: random.choice([0, 1000]),
+    "open_metadata_write_fault_one_in": lambda: random.choice([0, 0, 8]),
+    "open_write_fault_one_in": lambda: random.choice([0, 0, 16]),
+    "open_read_fault_one_in": lambda: random.choice([0, 0, 32]),
     "sync_fault_injection": False,
     "get_property_one_in": 1000000,
     "paranoid_file_checks": lambda: random.choice([0, 1, 1, 1]),
     "max_write_buffer_size_to_maintain": lambda: random.choice(
         [0, 1024 * 1024, 2 * 1024 * 1024, 4 * 1024 * 1024, 8 * 1024 * 1024]),
+    "user_timestamp_size": 0,
 }
 
 _TEST_DIR_ENV_VAR = 'TEST_TMPDIR'
 _DEBUG_LEVEL_ENV_VAR = 'DEBUG_LEVEL'
 
+stress_cmd = "./db_stress"
 
 def is_release_mode():
     return os.environ.get(_DEBUG_LEVEL_ENV_VAR) == "0"
@@ -213,6 +220,7 @@ whitebox_default_params = {
 simple_default_params = {
     "allow_concurrent_memtable_write": lambda: random.randint(0, 1),
     "column_families": 1,
+    "experimental_allow_mempurge": 0,
     "max_background_compactions": 1,
     "max_bytes_for_level_base": 67108864,
     "memtablerep": "skip_list",
@@ -271,15 +279,30 @@ blob_params = {
     # Enable blob files and GC with a 75% chance initially; note that they might still be
     # enabled/disabled during the test via SetOptions
     "enable_blob_files": lambda: random.choice([0] + [1] * 3),
-    "min_blob_size": lambda: random.choice([0, 16, 256]),
+    "min_blob_size": lambda: random.choice([0, 8, 16]),
     "blob_file_size": lambda: random.choice([1048576, 16777216, 268435456, 1073741824]),
     "blob_compression_type": lambda: random.choice(["none", "snappy", "lz4", "zstd"]),
     "enable_blob_garbage_collection": lambda: random.choice([0] + [1] * 3),
     "blob_garbage_collection_age_cutoff": lambda: random.choice([0.0, 0.25, 0.5, 0.75, 1.0]),
-    # The following are currently incompatible with the integrated BlobDB
+}
+
+ts_params = {
+    "test_cf_consistency": 0,
+    "test_batches_snapshots": 0,
+    "user_timestamp_size": 8,
     "use_merge": 0,
+    "use_full_merge_v1": 0,
+    # In order to disable SingleDelete
+    "nooverwritepercent": 0,
+    "use_txn": 0,
+    "read_only": 0,
+    "secondary_catch_up_one_in": 0,
+    "continuous_verification_interval": 0,
+    "checkpoint_one_in": 0,
+    "enable_blob_files": 0,
+    "use_blob_db": 0,
     "enable_compaction_filter": 0,
-    "backup_one_in": 0,
+    "ingest_external_file_one_in": 0,
 }
 
 def finalize_and_sanitize(src_params):
@@ -307,9 +330,10 @@ def finalize_and_sanitize(src_params):
         else:
             dest_params["mock_direct_io"] = True
 
-    # DeleteRange is not currnetly compatible with Txns
-    if dest_params.get("test_batches_snapshots") == 1 or \
-            dest_params.get("use_txn") == 1:
+    # DeleteRange is not currnetly compatible with Txns and timestamp
+    if (dest_params.get("test_batches_snapshots") == 1 or
+        dest_params.get("use_txn") == 1 or
+        dest_params.get("user_timestamp_size") > 0):
         dest_params["delpercent"] += dest_params["delrangepercent"]
         dest_params["delrangepercent"] = 0
     # Only under WritePrepared txns, unordered_write would provide the same guarnatees as vanilla rocksdb
@@ -374,11 +398,15 @@ def gen_cmd_params(args):
         params.update(txn_params)
     if args.test_best_efforts_recovery:
         params.update(best_efforts_recovery_params)
+    if args.enable_ts:
+        params.update(ts_params)
 
     # Best-effort recovery and BlobDB are currently incompatible. Test BE recovery
     # if specified on the command line; otherwise, apply BlobDB related overrides
     # with a 10% chance.
-    if not args.test_best_efforts_recovery and random.choice([0] * 9 + [1]) == 1:
+    if (not args.test_best_efforts_recovery and
+        not args.enable_ts and
+        random.choice([0] * 9 + [1]) == 1):
         params.update(blob_params)
 
     for k, v in vars(args).items():
@@ -389,12 +417,12 @@ def gen_cmd_params(args):
 
 def gen_cmd(params, unknown_params):
     finalzied_params = finalize_and_sanitize(params)
-    cmd = ['./db_stress'] + [
+    cmd = [stress_cmd] + [
         '--{0}={1}'.format(k, v)
         for k, v in [(k, finalzied_params[k]) for k in sorted(finalzied_params)]
         if k not in set(['test_type', 'simple', 'duration', 'interval',
                          'random_kill_odd', 'cf_consistency', 'txn',
-                         'test_best_efforts_recovery'])
+                         'test_best_efforts_recovery', 'enable_ts', 'stress_cmd'])
         and v is not None] + unknown_params
     return cmd
 
@@ -435,6 +463,25 @@ def inject_inconsistencies_to_db_dir(dir_path):
         with open(os.path.join(dir_path, fname), "w") as fd:
             fd.write("garbage")
 
+def execute_cmd(cmd, timeout):
+    child = subprocess.Popen(cmd, stderr=subprocess.PIPE,
+                             stdout=subprocess.PIPE)
+    print("Running db_stress with pid=%d: %s\n\n"
+          % (child.pid, ' '.join(cmd)))
+
+    try:
+        outs, errs = child.communicate(timeout=timeout)
+        hit_timeout = False
+        print("WARNING: db_stress ended before kill: exitcode=%d\n"
+              % child.returncode)
+    except subprocess.TimeoutExpired:
+        hit_timeout = True
+        child.kill()
+        print("KILLED %d\n" % child.pid)
+        outs, errs = child.communicate()
+
+    return hit_timeout, child.returncode, outs.decode('utf-8'), errs.decode('utf-8')
+
 
 # This script runs and kills db_stress multiple times. It checks consistency
 # in case of unsafe crashes in RocksDB.
@@ -448,46 +495,25 @@ def blackbox_crash_main(args, unknown_args):
           + "total-duration=" + str(cmd_params['duration']) + "\n")
 
     while time.time() < exit_time:
-        run_had_errors = False
-        killtime = time.time() + cmd_params['interval']
-
         cmd = gen_cmd(dict(
             list(cmd_params.items())
             + list({'db': dbname}.items())), unknown_args)
 
-        child = subprocess.Popen(cmd, stderr=subprocess.PIPE)
-        print("Running db_stress with pid=%d: %s\n\n"
-              % (child.pid, ' '.join(cmd)))
+        hit_timeout, retcode, outs, errs = execute_cmd(cmd, cmd_params['interval'])
 
-        stop_early = False
-        while time.time() < killtime:
-            if child.poll() is not None:
-                print("WARNING: db_stress ended before kill: exitcode=%d\n"
-                      % child.returncode)
-                stop_early = True
-                break
-            time.sleep(1)
+        if not hit_timeout:
+            print('Exit Before Killing')
+            print('stdout:')
+            print(outs)
+            print('stderr:')
+            print(errs)
+            sys.exit(2)
 
-        if not stop_early:
-            if child.poll() is not None:
-                print("WARNING: db_stress ended before kill: exitcode=%d\n"
-                      % child.returncode)
-            else:
-                child.kill()
-                print("KILLED %d\n" % child.pid)
-                time.sleep(1)  # time to stabilize after a kill
-
-        while True:
-            line = child.stderr.readline().strip().decode('utf-8')
-            if line == '':
-                break
-            elif not line.startswith('WARNING'):
+        for line in errs.split('\n'):
+            if line != '' and  not line.startswith('WARNING'):
                 run_had_errors = True
                 print('stderr has error message:')
                 print('***' + line + '***')
-
-        if run_had_errors:
-            sys.exit(2)
 
         time.sleep(1)  # time to stabilize before the next run
 
@@ -588,18 +614,24 @@ def whitebox_crash_main(args, unknown_args):
 
         print("Running:" + ' '.join(cmd) + "\n")  # noqa: E999 T25377293 Grandfathered in
 
-        popen = subprocess.Popen(cmd, stdout=subprocess.PIPE,
-                                 stderr=subprocess.STDOUT)
-        stdoutdata, stderrdata = popen.communicate()
-        if stdoutdata:
-            stdoutdata = stdoutdata.decode('utf-8')
-        if stderrdata:
-            stderrdata = stderrdata.decode('utf-8')
-        retncode = popen.returncode
+        # If the running time is 15 minutes over the run time, explicit kill and
+        # exit even if white box kill didn't hit. This is to guarantee run time
+        # limit, as if it runs as a job, running too long will create problems
+        # for job scheduling or execution.
+        # TODO detect a hanging condition. The job might run too long as RocksDB
+        # hits a hanging bug.
+        hit_timeout, retncode, stdoutdata, stderrdata = execute_cmd(
+            cmd, exit_time - time.time() + 900)
         msg = ("check_mode={0}, kill option={1}, exitcode={2}\n".format(
                check_mode, additional_opts['kill_random_test'], retncode))
+
         print(msg)
         print(stdoutdata)
+        print(stderrdata)
+
+        if hit_timeout:
+            print("Killing the run for running too long")
+            break
 
         expected = False
         if additional_opts['kill_random_test'] is None and (retncode == 0):
@@ -614,15 +646,16 @@ def whitebox_crash_main(args, unknown_args):
             print("TEST FAILED. See kill option and exit code above!!!\n")
             sys.exit(1)
 
-        stdoutdata = stdoutdata.lower()
-        errorcount = (stdoutdata.count('error') -
-                      stdoutdata.count('got errors 0 times'))
-        print("#times error occurred in output is " + str(errorcount) + "\n")
+        stderrdata = stderrdata.lower()
+        errorcount = (stderrdata.count('error') -
+                      stderrdata.count('got errors 0 times'))
+        print("#times error occurred in output is " + str(errorcount) +
+                "\n")
 
         if (errorcount > 0):
             print("TEST FAILED. Output has 'error'!!!\n")
             sys.exit(2)
-        if (stdoutdata.find('fail') >= 0):
+        if (stderrdata.find('fail') >= 0):
             print("TEST FAILED. Output has 'fail'!!!\n")
             sys.exit(2)
 
@@ -640,6 +673,8 @@ def whitebox_crash_main(args, unknown_args):
 
 
 def main():
+    global stress_cmd
+
     parser = argparse.ArgumentParser(description="This script runs and kills \
         db_stress multiple times")
     parser.add_argument("test_type", choices=["blackbox", "whitebox"])
@@ -647,6 +682,8 @@ def main():
     parser.add_argument("--cf_consistency", action='store_true')
     parser.add_argument("--txn", action='store_true')
     parser.add_argument("--test_best_efforts_recovery", action='store_true')
+    parser.add_argument("--enable_ts", action='store_true')
+    parser.add_argument("--stress_cmd")
 
     all_params = dict(list(default_params.items())
                       + list(blackbox_default_params.items())
@@ -654,7 +691,8 @@ def main():
                       + list(simple_default_params.items())
                       + list(blackbox_simple_default_params.items())
                       + list(whitebox_simple_default_params.items())
-                      + list(blob_params.items()))
+                      + list(blob_params.items())
+                      + list(ts_params.items()))
 
     for k, v in all_params.items():
         parser.add_argument("--" + k, type=type(v() if callable(v) else v))
@@ -667,6 +705,8 @@ def main():
                 (_TEST_DIR_ENV_VAR, test_tmpdir))
         sys.exit(1)
 
+    if args.stress_cmd:
+        stress_cmd = args.stress_cmd
     if args.test_type == 'blackbox':
         blackbox_crash_main(args, unknown_args)
     if args.test_type == 'whitebox':

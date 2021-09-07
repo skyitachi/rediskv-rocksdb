@@ -30,6 +30,9 @@ int main() {
 
 using GFLAGS_NAMESPACE::ParseCommandLineFlags;
 
+// The test is not fully designed for bits_per_key other than 10, but with
+// this parameter you can easily explore the behavior of other bits_per_key.
+// See also filter_bench.
 DEFINE_int32(bits_per_key, 10, "");
 
 namespace ROCKSDB_NAMESPACE {
@@ -158,7 +161,8 @@ TEST_F(BlockBasedBloomTest, VaryingLengths) {
     }
     Build();
 
-    ASSERT_LE(FilterSize(), (size_t)((length * 10 / 8) + 40)) << length;
+    ASSERT_LE(FilterSize(), (size_t)((length * FLAGS_bits_per_key / 8) + 40))
+        << length;
 
     // All added keys must match
     for (int i = 0; i < length; i++) {
@@ -172,11 +176,16 @@ TEST_F(BlockBasedBloomTest, VaryingLengths) {
       fprintf(stderr, "False positives: %5.2f%% @ length = %6d ; bytes = %6d\n",
               rate*100.0, length, static_cast<int>(FilterSize()));
     }
-    ASSERT_LE(rate, 0.02);   // Must not be over 2%
-    if (rate > 0.0125) mediocre_filters++;  // Allowed, but not too often
-    else good_filters++;
+    if (FLAGS_bits_per_key == 10) {
+      ASSERT_LE(rate, 0.02);  // Must not be over 2%
+      if (rate > 0.0125) {
+        mediocre_filters++;  // Allowed, but not too often
+      } else {
+        good_filters++;
+      }
+    }
   }
-  if (kVerbose >= 1) {
+  if (FLAGS_bits_per_key == 10 && kVerbose >= 1) {
     fprintf(stderr, "Filters: %d good, %d mediocre\n",
             good_filters, mediocre_filters);
   }
@@ -431,10 +440,10 @@ TEST_P(FullBloomTest, FilterSize) {
       size_t n2 = bits_builder->ApproximateNumEntries(space);
       EXPECT_GE(n2, n);
       size_t space2 = bits_builder->CalculateSpace(n2);
-      if (n > 6000 && GetParam() == BloomFilterPolicy::kStandard128Ribbon) {
+      if (n > 12000 && GetParam() == BloomFilterPolicy::kStandard128Ribbon) {
         // TODO(peterd): better approximation?
         EXPECT_GE(space2, space);
-        EXPECT_LE(space2 * 0.98 - 16.0, space * 1.0);
+        EXPECT_LE(space2 * 0.998, space * 1.0);
       } else {
         EXPECT_EQ(space2, space);
       }
@@ -481,8 +490,8 @@ TEST_P(FullBloomTest, FullVaryingLengths) {
     }
     Build();
 
-    EXPECT_LE(FilterSize(),
-              (size_t)((length * 10 / 8) + CACHE_LINE_SIZE * 2 + 5));
+    EXPECT_LE(FilterSize(), (size_t)((length * FLAGS_bits_per_key / 8) +
+                                     CACHE_LINE_SIZE * 2 + 5));
 
     // All added keys must match
     for (int i = 0; i < length; i++) {
@@ -496,11 +505,14 @@ TEST_P(FullBloomTest, FullVaryingLengths) {
       fprintf(stderr, "False positives: %5.2f%% @ length = %6d ; bytes = %6d\n",
               rate*100.0, length, static_cast<int>(FilterSize()));
     }
-    EXPECT_LE(rate, 0.02);  // Must not be over 2%
-    if (rate > 0.0125)
-      mediocre_filters++;  // Allowed, but not too often
-    else
-      good_filters++;
+    if (FLAGS_bits_per_key == 10) {
+      EXPECT_LE(rate, 0.02);  // Must not be over 2%
+      if (rate > 0.0125) {
+        mediocre_filters++;  // Allowed, but not too often
+      } else {
+        good_filters++;
+      }
+    }
   }
   if (kVerbose >= 1) {
     fprintf(stderr, "Filters: %d good, %d mediocre\n",
@@ -538,8 +550,10 @@ TEST_P(FullBloomTest, OptimizeForMemory) {
       total_keys += nkeys;
       total_fp_rate += FalsePositiveRate();
     }
-    EXPECT_LE(total_fp_rate / double{nfilters}, 0.011);
-    EXPECT_GE(total_fp_rate / double{nfilters}, 0.008);
+    if (FLAGS_bits_per_key == 10) {
+      EXPECT_LE(total_fp_rate / double{nfilters}, 0.011);
+      EXPECT_GE(total_fp_rate / double{nfilters}, 0.008);
+    }
 
     int64_t ex_min_total_size = int64_t{FLAGS_bits_per_key} * total_keys / 8;
     if (GetParam() == BloomFilterPolicy::kStandard128Ribbon) {
@@ -675,7 +689,7 @@ TEST_P(FullBloomTest, Schema) {
       BloomHash(FilterData()),
       SelectByCacheLineSize(1567096579, 1964771444, 2659542661U));
   EXPECT_EQ_FastBloom(BloomHash(FilterData()), 3817481309U);
-  EXPECT_EQ_Ribbon(BloomHash(FilterData()), 1705851228);
+  EXPECT_EQ_Ribbon(BloomHash(FilterData()), 1705851228U);
 
   EXPECT_EQ_FastBloom("11,13,17,25,29,30,35,37,45,53", FirstFPs(10));
   EXPECT_EQ_Ribbon("3,8,10,17,19,20,23,28,31,32", FirstFPs(10));
@@ -692,7 +706,7 @@ TEST_P(FullBloomTest, Schema) {
       BloomHash(FilterData()),
       SelectByCacheLineSize(2707206547U, 2571983456U, 218344685));
   EXPECT_EQ_FastBloom(BloomHash(FilterData()), 2807269961U);
-  EXPECT_EQ_Ribbon(BloomHash(FilterData()), 1095342358);
+  EXPECT_EQ_Ribbon(BloomHash(FilterData()), 1095342358U);
 
   EXPECT_EQ_FastBloom("4,15,17,24,27,28,29,53,63,70", FirstFPs(10));
   EXPECT_EQ_Ribbon("3,17,20,28,32,33,36,43,49,54", FirstFPs(10));
@@ -708,7 +722,7 @@ TEST_P(FullBloomTest, Schema) {
   EXPECT_EQ_LegacyBloom(
       BloomHash(FilterData()),
       SelectByCacheLineSize(515748486, 94611728, 2436112214U));
-  EXPECT_EQ_FastBloom(BloomHash(FilterData()), 204628445);
+  EXPECT_EQ_FastBloom(BloomHash(FilterData()), 204628445U);
   EXPECT_EQ_Ribbon(BloomHash(FilterData()), 3971337699U);
 
   EXPECT_EQ_FastBloom("15,24,29,39,53,87,89,100,103,104", FirstFPs(10));
@@ -725,7 +739,7 @@ TEST_P(FullBloomTest, Schema) {
   EXPECT_EQ_LegacyBloom(
       BloomHash(FilterData()),
       SelectByCacheLineSize(1302145999, 2811644657U, 756553699));
-  EXPECT_EQ_FastBloom(BloomHash(FilterData()), 355564975);
+  EXPECT_EQ_FastBloom(BloomHash(FilterData()), 355564975U);
   EXPECT_EQ_Ribbon(BloomHash(FilterData()), 3651449053U);
 
   EXPECT_EQ_FastBloom("16,60,66,126,220,238,244,256,265,287", FirstFPs(10));
@@ -743,7 +757,7 @@ TEST_P(FullBloomTest, Schema) {
       BloomHash(FilterData()),
       SelectByCacheLineSize(2092755149, 661139132, 1182970461));
   EXPECT_EQ_FastBloom(BloomHash(FilterData()), 2137566013U);
-  EXPECT_EQ_Ribbon(BloomHash(FilterData()), 1005676675);
+  EXPECT_EQ_Ribbon(BloomHash(FilterData()), 1005676675U);
 
   EXPECT_EQ_FastBloom("156,367,791,872,945,1015,1139,1159,1265", FirstFPs(9));
   EXPECT_EQ_Ribbon("33,187,203,296,411,419,604,612,615,619", FirstFPs(10));
@@ -784,7 +798,7 @@ TEST_P(FullBloomTest, Schema) {
       BloomHash(FilterData()),
       SelectByCacheLineSize(178861123, 379087593, 2574136516U));
   EXPECT_EQ_FastBloom(BloomHash(FilterData()), 3709876890U);
-  EXPECT_EQ_Ribbon(BloomHash(FilterData()), 1855638875);
+  EXPECT_EQ_Ribbon(BloomHash(FilterData()), 1855638875U);
 
   EXPECT_EQ_FastBloom("130,240,522,565,989,2002,2526,3147,3543", FirstFPs(9));
   EXPECT_EQ_Ribbon("665,727,1323,1755,3866,4232,4442,4492,4736", FirstFPs(9));
@@ -806,8 +820,8 @@ TEST_P(FullBloomTest, Schema) {
   EXPECT_EQ_LegacyBloom(
       BloomHash(FilterData()),
       SelectByCacheLineSize(1129406313, 3049154394U, 1727750964));
-  EXPECT_EQ_FastBloom(BloomHash(FilterData()), 1087138490);
-  EXPECT_EQ_Ribbon(BloomHash(FilterData()), 459379967);
+  EXPECT_EQ_FastBloom(BloomHash(FilterData()), 1087138490U);
+  EXPECT_EQ_Ribbon(BloomHash(FilterData()), 459379967U);
 
   EXPECT_EQ_FastBloom("3299,3611,3916,6620,7822,8079,8482,8942", FirstFPs(8));
   EXPECT_EQ_Ribbon("727,1323,1755,4442,4736,5386,6974,7154,8222", FirstFPs(9));
@@ -824,7 +838,7 @@ TEST_P(FullBloomTest, Schema) {
       BloomHash(FilterData()),
       SelectByCacheLineSize(1478976371, 2910591341U, 1182970461));
   EXPECT_EQ_FastBloom(BloomHash(FilterData()), 2498541272U);
-  EXPECT_EQ_Ribbon(BloomHash(FilterData()), 1273231667);
+  EXPECT_EQ_Ribbon(BloomHash(FilterData()), 1273231667U);
 
   EXPECT_EQ_FastBloom("16,126,133,422,466,472,813,1002,1035", FirstFPs(9));
   EXPECT_EQ_Ribbon("296,411,419,612,619,623,630,665,686,727", FirstFPs(10));
@@ -857,8 +871,8 @@ TEST_P(FullBloomTest, Schema) {
   EXPECT_EQ_LegacyBloom(
       BloomHash(FilterData()),
       SelectByCacheLineSize(2885052954U, 769447944, 4175124908U));
-  EXPECT_EQ_FastBloom(BloomHash(FilterData()), 23699164);
-  EXPECT_EQ_Ribbon(BloomHash(FilterData()), 1942323379);
+  EXPECT_EQ_FastBloom(BloomHash(FilterData()), 23699164U);
+  EXPECT_EQ_Ribbon(BloomHash(FilterData()), 1942323379U);
 
   EXPECT_EQ_FastBloom("16,126,133,422,466,472,813,1002,1035", FirstFPs(9));
   EXPECT_EQ_Ribbon("33,95,360,589,737,911,990,1048,1081,1414", FirstFPs(10));
@@ -878,7 +892,7 @@ TEST_P(FullBloomTest, Schema) {
       BloomHash(FilterData()),
       /*SAME*/ SelectByCacheLineSize(2885052954U, 769447944, 4175124908U));
   EXPECT_EQ_FastBloom(BloomHash(FilterData()), 3166884174U);
-  EXPECT_EQ_Ribbon(BloomHash(FilterData()), 1148258663);
+  EXPECT_EQ_Ribbon(BloomHash(FilterData()), 1148258663U);
 
   EXPECT_EQ_FastBloom("126,156,367,444,458,791,813,976,1015", FirstFPs(9));
   EXPECT_EQ_Ribbon("33,54,95,360,589,693,737,911,990,1048", FirstFPs(10));
@@ -896,7 +910,7 @@ TEST_P(FullBloomTest, Schema) {
       BloomHash(FilterData()),
       /*SAME*/ SelectByCacheLineSize(2885052954U, 769447944, 4175124908U));
   EXPECT_EQ_FastBloom(BloomHash(FilterData()), 4098502778U);
-  EXPECT_EQ_Ribbon(BloomHash(FilterData()), 792138188);
+  EXPECT_EQ_Ribbon(BloomHash(FilterData()), 792138188U);
 
   EXPECT_EQ_FastBloom("16,236,240,472,1015,1045,1111,1409,1465", FirstFPs(9));
   EXPECT_EQ_Ribbon("33,95,360,589,737,990,1048,1081,1414,1643", FirstFPs(10));

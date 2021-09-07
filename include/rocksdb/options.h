@@ -20,6 +20,7 @@
 #include "rocksdb/advanced_options.h"
 #include "rocksdb/comparator.h"
 #include "rocksdb/compression_type.h"
+#include "rocksdb/customizable.h"
 #include "rocksdb/data_structure.h"
 #include "rocksdb/env.h"
 #include "rocksdb/file_checksum.h"
@@ -128,9 +129,10 @@ struct ColumnFamilyOptions : public AdvancedColumnFamilyOptions {
   // Allows an application to modify/delete a key-value during background
   // compaction.
   //
-  // If the client requires a new compaction filter to be used for different
-  // compaction runs, it can specify compaction_filter_factory instead of this
-  // option.  The client should specify only one of the two.
+  // If the client requires a new `CompactionFilter` to be used for different
+  // compaction runs and/or requires a `CompactionFilter` for table file
+  // creations outside of compaction, it can specify compaction_filter_factory
+  // instead of this option.  The client should specify only one of the two.
   // compaction_filter takes precedence over compaction_filter_factory if
   // client specifies both.
   //
@@ -141,12 +143,21 @@ struct ColumnFamilyOptions : public AdvancedColumnFamilyOptions {
   // Default: nullptr
   const CompactionFilter* compaction_filter = nullptr;
 
-  // This is a factory that provides compaction filter objects which allow
-  // an application to modify/delete a key-value during background compaction.
+  // This is a factory that provides `CompactionFilter` objects which allow
+  // an application to modify/delete a key-value during table file creation.
   //
-  // A new filter will be created on each compaction run.  If multithreaded
-  // compaction is being used, each created CompactionFilter will only be used
-  // from a single thread and so does not need to be thread-safe.
+  // Unlike the `compaction_filter` option, which is used when compaction
+  // creates a table file, this factory allows using a `CompactionFilter` when a
+  // table file is created for various reasons. The factory can decide what
+  // `TableFileCreationReason`s use a `CompactionFilter`. For compatibility, by
+  // default the decision is to use a `CompactionFilter` for
+  // `TableFileCreationReason::kCompaction` only.
+  //
+  // Each thread of work involving creating table files will create a new
+  // `CompactionFilter` when it will be used according to the above
+  // `TableFileCreationReason`-based decision. This allows the application to
+  // know about the different ongoing threads of work and makes it unnecessary
+  // for `CompactionFilter` to provide thread-safety.
   //
   // Default: nullptr
   std::shared_ptr<CompactionFilterFactory> compaction_filter_factory = nullptr;
@@ -200,14 +211,18 @@ struct ColumnFamilyOptions : public AdvancedColumnFamilyOptions {
   CompressionType compression;
 
   // Compression algorithm that will be used for the bottommost level that
-  // contain files.
+  // contain files. The behavior for num_levels = 1 is not well defined.
+  // Right now, with num_levels = 1,  all compaction outputs will use
+  // bottommost_compression and all flush outputs still use options.compression,
+  // but the behavior is subject to change.
   //
   // Default: kDisableCompressionOption (Disabled)
   CompressionType bottommost_compression = kDisableCompressionOption;
 
   // different options for compression algorithms used by bottommost_compression
   // if it is enabled. To enable it, please see the definition of
-  // CompressionOptions.
+  // CompressionOptions. Behavior for num_levels = 1 is the same as
+  // options.bottommost_compression.
   CompressionOptions bottommost_compression_opts;
 
   // different options for compression algorithms
@@ -354,6 +369,35 @@ struct DbPath {
 
 extern const char* kHostnameForDbHostId;
 
+enum class CompactionServiceJobStatus : char {
+  kSuccess,
+  kFailure,
+  kUseLocal,  // TODO: Add support for use local compaction
+};
+
+class CompactionService : public Customizable {
+ public:
+  static const char* Type() { return "CompactionService"; }
+
+  // Returns the name of this compaction service.
+  virtual const char* Name() const = 0;
+
+  // Start the compaction with input information, which can be passed to
+  // `DB::OpenAndCompact()`.
+  // job_id is pre-assigned, it will be reset after DB re-open.
+  // TODO: sub-compaction is not supported, as they will have the same job_id, a
+  // sub-compaction id might be added
+  virtual CompactionServiceJobStatus Start(
+      const std::string& compaction_service_input, uint64_t job_id) = 0;
+
+  // Wait compaction to be finish.
+  // TODO: Add output path override
+  virtual CompactionServiceJobStatus WaitForComplete(
+      uint64_t job_id, std::string* compaction_service_result) = 0;
+
+  virtual ~CompactionService() {}
+};
+
 struct DBOptions {
   // The function recovers options to the option as in version 4.6.
   DBOptions* OldDefaults(int rocksdb_major_version = 4,
@@ -395,6 +439,13 @@ struct DBOptions {
   // In most cases you want this to be set to true.
   // Default: true
   bool paranoid_checks = true;
+
+  // If true, during memtable flush, RocksDB will validate total entries
+  // read in flush, and compare with counter inserted into it.
+  // The option is here to turn the feature off in case this new validation
+  // feature has a bug.
+  // Default: true
+  bool flush_verify_memtable_count = true;
 
   // If true, the log numbers and sizes of the synced WALs are tracked
   // in MANIFEST, then during DB recovery, if a synced WAL is missing
@@ -731,6 +782,10 @@ struct DBOptions {
   // Default: true
   bool advise_random_on_open = true;
 
+  // If true, allows for memtable purge instead of flush to storage.
+  // (experimental).
+  bool experimental_allow_mempurge = false;
+
   // Amount of data to build up in memtables across all column
   // families before writing to disk.
   //
@@ -836,7 +891,7 @@ struct DBOptions {
   // Allows OS to incrementally sync files to disk while they are being
   // written, asynchronously, in the background. This operation can be used
   // to smooth out write I/Os over time. Users shouldn't rely on it for
-  // persistency guarantee.
+  // persistence guarantee.
   // Issue one request for every bytes_per_sync written. 0 turns it off.
   //
   // You may consider using rate_limiter to regulate write rate to device.
@@ -1190,7 +1245,7 @@ struct DBOptions {
   // writing a file, by tracing back to the writing host. These corruptions
   // may not be caught by the checksum since they happen before checksumming.
   // If left as default, the table writer will substitute it with the actual
-  // hostname when writing the SST file. If set to an empty stirng, the
+  // hostname when writing the SST file. If set to an empty string, the
   // property will not be written to the SST file.
   //
   // Default: hostname
@@ -1205,6 +1260,15 @@ struct DBOptions {
   // should enble this set as empty. Otherwise,it may cause unexpected
   // write failures.
   FileTypeSet checksum_handoff_file_types;
+
+  // EXPERIMENTAL
+  // CompactionService is a feature allows the user to run compactions on a
+  // different host or process, which offloads the background load from the
+  // primary host.
+  // It's an experimental feature, the interface will be changed without
+  // backward/forward compatibility support for now. Some known issues are still
+  // under development.
+  std::shared_ptr<CompactionService> compaction_service = nullptr;
 };
 
 // Options to control the behavior of a database (passed to DB::Open)
@@ -1279,19 +1343,28 @@ struct ReadOptions {
   // Default: nullptr
   const Slice* iterate_lower_bound;
 
-  // "iterate_upper_bound" defines the extent upto which the forward iterator
+  // "iterate_upper_bound" defines the extent up to which the forward iterator
   // can returns entries. Once the bound is reached, Valid() will be false.
   // "iterate_upper_bound" is exclusive ie the bound value is
-  // not a valid entry. If prefix_extractor is not null, the Seek target
-  // and iterate_upper_bound need to have the same prefix.
-  // This is because ordering is not guaranteed outside of prefix domain.
+  // not a valid entry. If prefix_extractor is not null:
+  // 1. If options.auto_prefix_mode = true, iterate_upper_bound will be used
+  //    to infer whether prefix iterating (e.g. applying prefix bloom filter)
+  //    can be used within RocksDB. This is done by comparing
+  //    iterate_upper_bound with the seek key.
+  // 2. If options.auto_prefix_mode = false, iterate_upper_bound only takes
+  //    effect if it shares the same prefix as the seek key. If
+  //    iterate_upper_bound is outside the prefix of the seek key, then keys
+  //    returned outside the prefix range will be undefined, just as if
+  //    iterate_upper_bound = null.
+  // If iterate_upper_bound is not null, SeekToLast() will position the iterator
+  // at the first key smaller than iterate_upper_bound.
   //
   // Default: nullptr
   const Slice* iterate_upper_bound;
 
   // RocksDB does auto-readahead for iterators on noticing more than two reads
   // for a table file. The readahead starts at 8KB and doubles on every
-  // additional read upto 256KB.
+  // additional read up to 256KB.
   // This option can help if most of the range scans are large, and if it is
   // determined that a larger readahead than that enabled by auto-readahead is
   // needed.
@@ -1317,7 +1390,7 @@ struct ReadOptions {
   // Default: true
   bool verify_checksums;
 
-  // Should the "data block"/"index block"" read for this iteration be placed in
+  // Should the "data block"/"index block" read for this iteration be placed in
   // block cache?
   // Callers may wish to set this field to false for bulk scans.
   // This would help not to the change eviction order of existing items in the
@@ -1349,7 +1422,7 @@ struct ReadOptions {
   // When true, by default use total_order_seek = true, and RocksDB can
   // selectively enable prefix seek mode if won't generate a different result
   // from total_order_seek, based on seek key, and iterator upper bound.
-  // Not suppported in ROCKSDB_LITE mode, in the way that even with value true
+  // Not supported in ROCKSDB_LITE mode, in the way that even with value true
   // prefix mode is not used.
   // Default: false
   bool auto_prefix_mode;
@@ -1425,7 +1498,7 @@ struct ReadOptions {
   // A timeout in microseconds to be passed to the underlying FileSystem for
   // reads. As opposed to deadline, this determines the timeout for each
   // individual file read request. If a MultiGet/Get/Seek/Next etc call
-  // results in multiple reads, each read can last upto io_timeout us.
+  // results in multiple reads, each read can last up to io_timeout us.
   std::chrono::microseconds io_timeout;
 
   // It limits the maximum cumulative value size of the keys in batch while
@@ -1479,7 +1552,7 @@ struct WriteOptions {
   bool no_slowdown;
 
   // If true, this write request is of lower priority if compaction is
-  // behind. In this case, no_slowdown = true, the request will be cancelled
+  // behind. In this case, no_slowdown = true, the request will be canceled
   // immediately with Status::Incomplete() returned. Otherwise, it will be
   // slowed down. The slowdown value is determined by RocksDB to guarantee
   // it introduces minimum impacts to high priority writes.
@@ -1597,6 +1670,9 @@ struct CompactRangeOptions {
   // Set user-defined timestamp low bound, the data with older timestamp than
   // low bound maybe GCed by compaction. Default: nullptr
   Slice* full_history_ts_low = nullptr;
+
+  // Allows cancellation of an in-progress manual compaction.
+  std::atomic<bool>* canceled = nullptr;
 };
 
 // IngestExternalFileOptions is used by IngestExternalFile()
@@ -1616,7 +1692,7 @@ struct IngestExternalFileOptions {
   bool allow_blocking_flush = true;
   // Set to true if you would like duplicate keys in the file being ingested
   // to be skipped rather than overwriting existing data under that key.
-  // Usecase: back-fill of some historical data in the database without
+  // Use case: back-fill of some historical data in the database without
   // over-writing existing newer version of data.
   // This option could only be used if the DB has been running
   // with allow_ingest_behind=true since the dawn of time.
@@ -1656,7 +1732,7 @@ struct IngestExternalFileOptions {
   // will be ignored; 2) If DB enable the checksum function, we calculate the
   // sst file checksum after the file is moved or copied and compare the
   // checksum and checksum name. If checksum or checksum function name does
-  // not match, ingestion will be failed. If the verification is sucessful,
+  // not match, ingestion will be failed. If the verification is successful,
   // checksum and checksum function name will be stored in Manifest.
   // If this option is set to FALSE, 1) if DB does not enable checksum,
   // the ingested checksum information will be ignored; 2) if DB enable the
@@ -1713,6 +1789,27 @@ struct SizeApproximationOptions {
   // If the value is non-positive - a more precise yet more CPU intensive
   // estimation is performed.
   double files_size_error_margin = -1.0;
+};
+
+struct CompactionServiceOptionsOverride {
+  // Currently pointer configurations are not passed to compaction service
+  // compaction so the user needs to set it. It will be removed once pointer
+  // configuration passing is supported.
+  Env* env = Env::Default();
+  std::shared_ptr<FileChecksumGenFactory> file_checksum_gen_factory = nullptr;
+
+  const Comparator* comparator = BytewiseComparator();
+  std::shared_ptr<MergeOperator> merge_operator = nullptr;
+  const CompactionFilter* compaction_filter = nullptr;
+  std::shared_ptr<CompactionFilterFactory> compaction_filter_factory = nullptr;
+  std::shared_ptr<const SliceTransform> prefix_extractor = nullptr;
+  std::shared_ptr<TableFactory> table_factory;
+  std::shared_ptr<SstPartitionerFactory> sst_partitioner_factory = nullptr;
+
+  // statistics is used to collect DB operation metrics, the metrics won't be
+  // returned to CompactionService primary host, to collect that, the user needs
+  // to set it here.
+  std::shared_ptr<Statistics> statistics = nullptr;
 };
 
 }  // namespace ROCKSDB_NAMESPACE
