@@ -1860,6 +1860,9 @@ class H : public WriteBatch::Handler {
     if (deleted_)
       (*deleted_)(state_, key.data(), key.size());
   }
+  Status DeleteRangeCF(uint32_t, const Slice&, const Slice&) override {
+    return Status::OK();
+  }
   void LogData(const Slice& blob) override {
     if (logdata_)
       (*logdata_)(state_, blob.data(), blob.size());
