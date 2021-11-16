@@ -70,6 +70,10 @@ struct CompactionOptionsFIFO {
   // Default: false;
   bool allow_compaction = false;
 
+  // When not 0, if the data in the file is older than this threshold, RocksDB
+  // will soon move the file to warm temperature.
+  uint64_t age_for_warm = 0;
+
   CompactionOptionsFIFO() : max_table_files_size(1 * 1024 * 1024 * 1024) {}
   CompactionOptionsFIFO(uint64_t _max_table_files_size, bool _allow_compaction)
       : max_table_files_size(_max_table_files_size),
@@ -196,6 +200,14 @@ enum class Temperature : uint8_t {
   kHot = 0x04,
   kWarm = 0x08,
   kCold = 0x0C,
+};
+
+// The control option of how the cache tiers will be used. Currently rocksdb
+// support block cahe (volatile tier), secondary cache (non-volatile tier).
+// In the future, we may add more caching layers.
+enum class CacheTier : uint8_t {
+  kVolatileTier = 0,
+  kNonVolatileBlockTier = 0x01,
 };
 
 enum UpdateStatus {    // Return status For inplace update callback
@@ -646,8 +658,8 @@ struct AdvancedColumnFamilyOptions {
   // the tables.
   // Default: empty vector -- no user-defined statistics collection will be
   // performed.
-  typedef std::vector<std::shared_ptr<TablePropertiesCollectorFactory>>
-      TablePropertiesCollectorFactories;
+  using TablePropertiesCollectorFactories =
+      std::vector<std::shared_ptr<TablePropertiesCollectorFactory>>;
   TablePropertiesCollectorFactories table_properties_collector_factories;
 
   // Maximum number of successive merge operations on a key in the memtable.
@@ -783,7 +795,8 @@ struct AdvancedColumnFamilyOptions {
   // amplification for large-value use cases at the cost of introducing a level
   // of indirection for reads. See also the options min_blob_size,
   // blob_file_size, blob_compression_type, enable_blob_garbage_collection,
-  // and blob_garbage_collection_age_cutoff below.
+  // blob_garbage_collection_age_cutoff, and
+  // blob_garbage_collection_force_threshold below.
   //
   // Default: false
   //
@@ -824,7 +837,8 @@ struct AdvancedColumnFamilyOptions {
   // compaction. Valid blobs residing in blob files older than a cutoff get
   // relocated to new files as they are encountered during compaction, which
   // makes it possible to clean up blob files once they contain nothing but
-  // obsolete/garbage blobs. See also blob_garbage_collection_age_cutoff below.
+  // obsolete/garbage blobs. See also blob_garbage_collection_age_cutoff and
+  // blob_garbage_collection_force_threshold below.
   //
   // Default: false
   //
@@ -841,6 +855,19 @@ struct AdvancedColumnFamilyOptions {
   //
   // Dynamically changeable through the SetOptions() API
   double blob_garbage_collection_age_cutoff = 0.25;
+
+  // If the ratio of garbage in the oldest blob files exceeds this threshold,
+  // targeted compactions are scheduled in order to force garbage collecting
+  // the blob files in question, assuming they are all eligible based on the
+  // value of blob_garbage_collection_age_cutoff above. This option is
+  // currently only supported with leveled compactions.
+  // Note that enable_blob_garbage_collection has to be set in order for this
+  // option to have any effect.
+  //
+  // Default: 1.0
+  //
+  // Dynamically changeable through the SetOptions() API
+  double blob_garbage_collection_force_threshold = 1.0;
 
   // Create ColumnFamilyOptions with default values for all fields
   AdvancedColumnFamilyOptions();

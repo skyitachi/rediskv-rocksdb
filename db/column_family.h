@@ -357,6 +357,7 @@ class ColumnFamilyData {
   uint64_t GetNumLiveVersions() const;  // REQUIRE: DB mutex held
   uint64_t GetTotalSstFilesSize() const;  // REQUIRE: DB mutex held
   uint64_t GetLiveSstFilesSize() const;   // REQUIRE: DB mutex held
+  uint64_t GetTotalBlobFileSize() const;  // REQUIRE: DB mutex held
   void SetMemtable(MemTable* new_mem) {
     uint64_t memtable_id = last_memtable_id_.fetch_add(1) + 1;
     new_mem->SetID(memtable_id);
@@ -368,10 +369,9 @@ class ColumnFamilyData {
 
   // See Memtable constructor for explanation of earliest_seq param.
   MemTable* ConstructNewMemtable(const MutableCFOptions& mutable_cf_options,
-                                 SequenceNumber earliest_seq,
-                                 uint64_t log_number = 0);
+                                 SequenceNumber earliest_seq);
   void CreateNewMemtable(const MutableCFOptions& mutable_cf_options,
-                         SequenceNumber earliest_seq, uint64_t log_number = 0);
+                         SequenceNumber earliest_seq);
 
   TableCache* table_cache() const { return table_cache_.get(); }
   BlobFileCache* blob_file_cache() const { return blob_file_cache_.get(); }
@@ -527,7 +527,7 @@ class ColumnFamilyData {
                    WriteBufferManager* write_buffer_manager,
                    const ColumnFamilyOptions& options,
                    const ImmutableDBOptions& db_options,
-                   const FileOptions& file_options,
+                   const FileOptions* file_options,
                    ColumnFamilySet* column_family_set,
                    BlockCacheTracer* const block_cache_tracer,
                    const std::shared_ptr<IOTracer>& io_tracer,
@@ -718,6 +718,8 @@ class ColumnFamilySet {
   std::unordered_map<uint32_t, ColumnFamilyData*> column_family_data_;
 
   uint32_t max_column_family_;
+  const FileOptions file_options_;
+
   ColumnFamilyData* dummy_cfd_;
   // We don't hold the refcount here, since default column family always exists
   // We are also not responsible for cleaning up default_cfd_cache_. This is
@@ -727,7 +729,6 @@ class ColumnFamilySet {
 
   const std::string db_name_;
   const ImmutableDBOptions* const db_options_;
-  const FileOptions file_options_;
   Cache* table_cache_;
   WriteBufferManager* write_buffer_manager_;
   WriteController* write_controller_;

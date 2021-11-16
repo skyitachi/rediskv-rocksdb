@@ -29,7 +29,7 @@
 #include "db/version_set.h"
 #include "db/write_controller.h"
 #include "file/sst_file_manager_impl.h"
-#include "memtable/hash_skiplist_rep.h"
+#include "logging/logging.h"
 #include "monitoring/thread_status_util.h"
 #include "options/options_helper.h"
 #include "port/port.h"
@@ -203,7 +203,7 @@ Status CheckCFPathsSupported(const DBOptions& db_options,
 namespace {
 const uint64_t kDefaultTtl = 0xfffffffffffffffe;
 const uint64_t kDefaultPeriodicCompSecs = 0xfffffffffffffffe;
-};  // namespace
+}  // namespace
 
 ColumnFamilyOptions SanitizeOptions(const ImmutableDBOptions& db_options,
                                     const ColumnFamilyOptions& src) {
@@ -349,12 +349,18 @@ ColumnFamilyOptions SanitizeOptions(const ImmutableDBOptions& db_options,
   }
 
   if (result.level_compaction_dynamic_level_bytes) {
-    if (result.compaction_style != kCompactionStyleLevel ||
-        result.cf_paths.size() > 1U) {
-      // 1. level_compaction_dynamic_level_bytes only makes sense for
-      //    level-based compaction.
-      // 2. we don't yet know how to make both of this feature and multiple
-      //    DB path work.
+    if (result.compaction_style != kCompactionStyleLevel) {
+      ROCKS_LOG_WARN(db_options.info_log.get(),
+                     "level_compaction_dynamic_level_bytes only makes sense"
+                     "for level-based compaction");
+      result.level_compaction_dynamic_level_bytes = false;
+    } else if (result.cf_paths.size() > 1U) {
+      // we don't yet know how to make both of this feature and multiple
+      // DB path work.
+      ROCKS_LOG_WARN(db_options.info_log.get(),
+                     "multiple cf_paths/db_paths and"
+                     "level_compaction_dynamic_level_bytes"
+                     "can't be used together");
       result.level_compaction_dynamic_level_bytes = false;
     }
   }
@@ -505,7 +511,7 @@ ColumnFamilyData::ColumnFamilyData(
     uint32_t id, const std::string& name, Version* _dummy_versions,
     Cache* _table_cache, WriteBufferManager* write_buffer_manager,
     const ColumnFamilyOptions& cf_options, const ImmutableDBOptions& db_options,
-    const FileOptions& file_options, ColumnFamilySet* column_family_set,
+    const FileOptions* file_options, ColumnFamilySet* column_family_set,
     BlockCacheTracer* const block_cache_tracer,
     const std::shared_ptr<IOTracer>& io_tracer,
     const std::string& db_session_id)
@@ -1049,25 +1055,26 @@ uint64_t ColumnFamilyData::GetTotalSstFilesSize() const {
   return VersionSet::GetTotalSstFilesSize(dummy_versions_);
 }
 
+uint64_t ColumnFamilyData::GetTotalBlobFileSize() const {
+  return VersionSet::GetTotalBlobFileSize(dummy_versions_);
+}
+
 uint64_t ColumnFamilyData::GetLiveSstFilesSize() const {
   return current_->GetSstFilesSize();
 }
 
 MemTable* ColumnFamilyData::ConstructNewMemtable(
-    const MutableCFOptions& mutable_cf_options, SequenceNumber earliest_seq,
-    uint64_t log_number) {
+    const MutableCFOptions& mutable_cf_options, SequenceNumber earliest_seq) {
   return new MemTable(internal_comparator_, ioptions_, mutable_cf_options,
-                      write_buffer_manager_, earliest_seq, id_, log_number);
+                      write_buffer_manager_, earliest_seq, id_);
 }
 
 void ColumnFamilyData::CreateNewMemtable(
-    const MutableCFOptions& mutable_cf_options, SequenceNumber earliest_seq,
-    uint64_t log_number) {
+    const MutableCFOptions& mutable_cf_options, SequenceNumber earliest_seq) {
   if (mem_ != nullptr) {
     delete mem_->Unref();
   }
-  SetMemtable(
-      ConstructNewMemtable(mutable_cf_options, earliest_seq, log_number));
+  SetMemtable(ConstructNewMemtable(mutable_cf_options, earliest_seq));
   mem_->Ref();
 }
 
@@ -1351,12 +1358,19 @@ Status ColumnFamilyData::ValidateOptions(
     }
   }
 
-  if (cf_options.enable_blob_garbage_collection &&
-      (cf_options.blob_garbage_collection_age_cutoff < 0.0 ||
-       cf_options.blob_garbage_collection_age_cutoff > 1.0)) {
-    return Status::InvalidArgument(
-        "The age cutoff for blob garbage collection should be in the range "
-        "[0.0, 1.0].");
+  if (cf_options.enable_blob_garbage_collection) {
+    if (cf_options.blob_garbage_collection_age_cutoff < 0.0 ||
+        cf_options.blob_garbage_collection_age_cutoff > 1.0) {
+      return Status::InvalidArgument(
+          "The age cutoff for blob garbage collection should be in the range "
+          "[0.0, 1.0].");
+    }
+    if (cf_options.blob_garbage_collection_force_threshold < 0.0 ||
+        cf_options.blob_garbage_collection_force_threshold > 1.0) {
+      return Status::InvalidArgument(
+          "The garbage ratio threshold for forcing blob garbage collection "
+          "should be in the range [0.0, 1.0].");
+    }
   }
 
   if (cf_options.compaction_style == kCompactionStyleFIFO &&
@@ -1456,14 +1470,14 @@ ColumnFamilySet::ColumnFamilySet(const std::string& dbname,
                                  const std::shared_ptr<IOTracer>& io_tracer,
                                  const std::string& db_session_id)
     : max_column_family_(0),
+      file_options_(file_options),
       dummy_cfd_(new ColumnFamilyData(
           ColumnFamilyData::kDummyColumnFamilyDataId, "", nullptr, nullptr,
-          nullptr, ColumnFamilyOptions(), *db_options, file_options, nullptr,
+          nullptr, ColumnFamilyOptions(), *db_options, &file_options_, nullptr,
           block_cache_tracer, io_tracer, db_session_id)),
       default_cfd_cache_(nullptr),
       db_name_(dbname),
       db_options_(db_options),
-      file_options_(file_options),
       table_cache_(table_cache),
       write_buffer_manager_(_write_buffer_manager),
       write_controller_(_write_controller),
@@ -1535,7 +1549,7 @@ ColumnFamilyData* ColumnFamilySet::CreateColumnFamily(
   assert(column_families_.find(name) == column_families_.end());
   ColumnFamilyData* new_cfd = new ColumnFamilyData(
       id, name, dummy_versions, table_cache_, write_buffer_manager_, options,
-      *db_options_, file_options_, this, block_cache_tracer_, io_tracer_,
+      *db_options_, &file_options_, this, block_cache_tracer_, io_tracer_,
       db_session_id_);
   column_families_.insert({name, id});
   column_family_data_.insert({id, new_cfd});

@@ -87,7 +87,18 @@ class Customizable : public Configurable {
   // @param name The name of the instance to find.
   // Returns true if the class is an instance of the input name.
   virtual bool IsInstanceOf(const std::string& name) const {
-    return name == Name();
+    if (name.empty()) {
+      return false;
+    } else if (name == Name()) {
+      return true;
+    } else {
+      const char* nickname = NickName();
+      if (nickname != nullptr && name == nickname) {
+        return true;
+      } else {
+        return false;
+      }
+    }
   }
 
   // Returns the named instance of the Customizable as a T*, or nullptr if not
@@ -179,6 +190,24 @@ class Customizable : public Configurable {
   virtual const Customizable* Inner() const { return nullptr; }
 
  protected:
+  // Generates a ID specific for this instance of the customizable.
+  // The unique ID is of the form <name>:<addr>#pid, where:
+  // - name is the Name() of this object;
+  // - addr is the memory address of this object;
+  // - pid is the process ID of this process ID for this process.
+  // Note that if obj1 and obj2 have the same unique IDs, they must be the
+  // same.  However, if an object is deleted and recreated, it may have the
+  // same unique ID as a predecessor
+  //
+  // This method is useful for objects (especially ManagedObjects) that
+  // wish to generate an ID that is specific for this instance and wish to
+  // override the GetId() method.
+  std::string GenerateIndividualId() const;
+
+  // Some classes have both a class name (e.g. PutOperator) and a nickname
+  // (e.g. put). Classes can override this method to return a
+  // nickname.  Nicknames can be used by InstanceOf and object creation.
+  virtual const char* NickName() const { return ""; }
   //  Given a name (e.g. rocksdb.my.type.opt), returns the short name (opt)
   std::string GetOptionName(const std::string& long_name) const override;
 #ifndef ROCKSDB_LITE

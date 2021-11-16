@@ -5,15 +5,18 @@
 //
 #include "db/memtable_list.h"
 
+#include <algorithm>
 #include <cinttypes>
 #include <limits>
 #include <queue>
 #include <string>
+
 #include "db/db_impl/db_impl.h"
 #include "db/memtable.h"
 #include "db/range_tombstone_fragmenter.h"
 #include "db/version_set.h"
 #include "logging/log_buffer.h"
+#include "logging/logging.h"
 #include "monitoring/thread_status_util.h"
 #include "rocksdb/db.h"
 #include "rocksdb/env.h"
@@ -340,6 +343,14 @@ void MemTableList::PickMemtablesToFlush(uint64_t max_memtable_id,
       ThreadStatus::STAGE_PICK_MEMTABLES_TO_FLUSH);
   const auto& memlist = current_->memlist_;
   bool atomic_flush = false;
+
+  // Note: every time MemTableList::Add(mem) is called, it adds the new mem
+  // at the FRONT of the memlist (memlist.push_front(mem)). Therefore, by
+  // iterating through the memlist starting at the end, the vector<MemTable*>
+  // ret is filled with memtables already sorted in increasing MemTable ID.
+  // However, when the mempurge feature is activated, new memtables with older
+  // IDs will be added to the memlist. Therefore we std::sort(ret) at the end to
+  // return a vector of memtables sorted by increasing memtable ID.
   for (auto it = memlist.rbegin(); it != memlist.rend(); ++it) {
     MemTable* m = *it;
     if (!atomic_flush && m->atomic_flush_seqno_ != kMaxSequenceNumber) {
@@ -361,6 +372,15 @@ void MemTableList::PickMemtablesToFlush(uint64_t max_memtable_id,
   if (!atomic_flush || num_flush_not_started_ == 0) {
     flush_requested_ = false;  // start-flush request is complete
   }
+
+  // Sort the list of memtables by increasing memtable ID.
+  // This is useful when the mempurge feature is activated
+  // and the memtables are not guaranteed to be sorted in
+  // the memlist vector.
+  std::sort(ret->begin(), ret->end(),
+            [](const MemTable* m1, const MemTable* m2) -> bool {
+              return m1->GetID() < m2->GetID();
+            });
 }
 
 void MemTableList::RollbackMemtableFlush(const autovector<MemTable*>& mems,
@@ -521,9 +541,14 @@ Status MemTableList::TryInstallMemtableFlushResults(
         // and don't commit anything to the manifest file.
         RemoveMemTablesOrRestoreFlags(s, cfd, batch_count, log_buffer,
                                       to_delete, mu);
+        // Note: cfd->SetLogNumber is only called when a VersionEdit
+        // is written to MANIFEST. When mempurge is succesful, we skip
+        // this step, therefore cfd->GetLogNumber is always is
+        // earliest log with data unflushed.
         // Notify new head of manifest write queue.
         // wake up all the waiting writers
-        // TODO(bjlemaire): explain full reason needed or investigate more.
+        // TODO(bjlemaire): explain full reason WakeUpWaitingManifestWriters
+        // needed or investigate more.
         vset->WakeUpWaitingManifestWriters();
         *io_s = IOStatus::OK();
       }
@@ -534,8 +559,7 @@ Status MemTableList::TryInstallMemtableFlushResults(
 }
 
 // New memtables are inserted at the front of the list.
-void MemTableList::Add(MemTable* m, autovector<MemTable*>* to_delete,
-                       bool trigger_flush) {
+void MemTableList::Add(MemTable* m, autovector<MemTable*>* to_delete) {
   assert(static_cast<int>(current_->memlist_.size()) >= num_flush_not_started_);
   InstallNewVersion();
   // this method is used to move mutable memtable into an immutable list.
@@ -546,8 +570,7 @@ void MemTableList::Add(MemTable* m, autovector<MemTable*>* to_delete,
   current_->Add(m, to_delete);
   m->MarkImmutable();
   num_flush_not_started_++;
-
-  if (num_flush_not_started_ > 0 && trigger_flush) {
+  if (num_flush_not_started_ == 1) {
     imm_flush_needed.store(true, std::memory_order_release);
   }
   UpdateCachedValuesFromMemTableListVersion();
@@ -692,21 +715,6 @@ void MemTableList::RemoveMemTablesOrRestoreFlags(
       ++mem_id;
     }
   }
-}
-
-// Returns the earliest log that possibly contain entries
-// from one of the memtables of this memtable_list.
-uint64_t MemTableList::EarliestLogContainingData() {
-  uint64_t min_log = 0;
-
-  for (auto& m : current_->memlist_) {
-    uint64_t log = m->GetEarliestLogFileNumber();
-    if (log > 0 && (min_log == 0 || log < min_log)) {
-      min_log = log;
-    }
-  }
-
-  return min_log;
 }
 
 uint64_t MemTableList::PrecomputeMinLogContainingPrepSection(
