@@ -25,6 +25,7 @@
 #include "db/blob/blob_file_cache.h"
 #include "db/blob/blob_file_reader.h"
 #include "db/blob/blob_index.h"
+#include "db/blob/blob_log_format.h"
 #include "db/internal_stats.h"
 #include "db/log_reader.h"
 #include "db/log_writer.h"
@@ -39,6 +40,7 @@
 #include "file/random_access_file_reader.h"
 #include "file/read_write_util.h"
 #include "file/writable_file_writer.h"
+#include "logging/logging.h"
 #include "monitoring/file_read_sample.h"
 #include "monitoring/perf_context_imp.h"
 #include "monitoring/persistent_stats_history.h"
@@ -1863,6 +1865,119 @@ Status Version::GetBlob(const ReadOptions& read_options, const Slice& user_key,
   return s;
 }
 
+void Version::MultiGetBlob(
+    const ReadOptions& read_options, MultiGetRange& range,
+    std::unordered_map<uint64_t, BlobReadRequests>& blob_rqs) {
+  if (read_options.read_tier == kBlockCacheTier) {
+    Status s = Status::Incomplete("Cannot read blob(s): no disk I/O allowed");
+    for (const auto& elem : blob_rqs) {
+      for (const auto& blob_rq : elem.second) {
+        const KeyContext& key_context = blob_rq.second;
+        assert(key_context.s);
+        assert(key_context.s->ok());
+        *(key_context.s) = s;
+        assert(key_context.get_context);
+        auto& get_context = *(key_context.get_context);
+        get_context.MarkKeyMayExist();
+      }
+    }
+    return;
+  }
+
+  assert(!blob_rqs.empty());
+  Status status;
+  const auto& blob_files = storage_info_.GetBlobFiles();
+  for (auto& elem : blob_rqs) {
+    uint64_t blob_file_number = elem.first;
+    if (blob_files.find(blob_file_number) == blob_files.end()) {
+      auto& blobs_in_file = elem.second;
+      for (const auto& blob : blobs_in_file) {
+        const KeyContext& key_context = blob.second;
+        *(key_context.s) = Status::Corruption("Invalid blob file number");
+      }
+      continue;
+    }
+    CacheHandleGuard<BlobFileReader> blob_file_reader;
+    assert(blob_file_cache_);
+    status = blob_file_cache_->GetBlobFileReader(blob_file_number,
+                                                 &blob_file_reader);
+    assert(!status.ok() || blob_file_reader.GetValue());
+
+    auto& blobs_in_file = elem.second;
+    if (!status.ok()) {
+      for (const auto& blob : blobs_in_file) {
+        const KeyContext& key_context = blob.second;
+        *(key_context.s) = status;
+      }
+      continue;
+    }
+
+    assert(blob_file_reader.GetValue());
+    const uint64_t file_size = blob_file_reader.GetValue()->GetFileSize();
+    const CompressionType compression =
+        blob_file_reader.GetValue()->GetCompressionType();
+
+    // sort blobs_in_file by file offset.
+    std::sort(
+        blobs_in_file.begin(), blobs_in_file.end(),
+        [](const BlobReadRequest& lhs, const BlobReadRequest& rhs) -> bool {
+          assert(lhs.first.file_number() == rhs.first.file_number());
+          return lhs.first.offset() < rhs.first.offset();
+        });
+
+    autovector<std::reference_wrapper<const KeyContext>> blob_read_key_contexts;
+    autovector<std::reference_wrapper<const Slice>> user_keys;
+    autovector<uint64_t> offsets;
+    autovector<uint64_t> value_sizes;
+    autovector<Status*> statuses;
+    autovector<PinnableSlice*> values;
+    for (const auto& blob : blobs_in_file) {
+      const auto& blob_index = blob.first;
+      const KeyContext& key_context = blob.second;
+      if (blob_index.HasTTL() || blob_index.IsInlined()) {
+        *(key_context.s) =
+            Status::Corruption("Unexpected TTL/inlined blob index");
+        continue;
+      }
+      const uint64_t key_size = key_context.ukey_with_ts.size();
+      const uint64_t offset = blob_index.offset();
+      const uint64_t value_size = blob_index.size();
+      if (!IsValidBlobOffset(offset, key_size, value_size, file_size)) {
+        *(key_context.s) = Status::Corruption("Invalid blob offset");
+        continue;
+      }
+      if (blob_index.compression() != compression) {
+        *(key_context.s) =
+            Status::Corruption("Compression type mismatch when reading a blob");
+        continue;
+      }
+      blob_read_key_contexts.emplace_back(std::cref(key_context));
+      user_keys.emplace_back(std::cref(key_context.ukey_with_ts));
+      offsets.push_back(blob_index.offset());
+      value_sizes.push_back(blob_index.size());
+      statuses.push_back(key_context.s);
+      values.push_back(key_context.value);
+    }
+    blob_file_reader.GetValue()->MultiGetBlob(read_options, user_keys, offsets,
+                                              value_sizes, statuses, values,
+                                              /*bytes_read=*/nullptr);
+    size_t num = blob_read_key_contexts.size();
+    assert(num == user_keys.size());
+    assert(num == offsets.size());
+    assert(num == value_sizes.size());
+    assert(num == statuses.size());
+    assert(num == values.size());
+    for (size_t i = 0; i < num; ++i) {
+      if (statuses[i]->ok()) {
+        range.AddValueSize(blob_read_key_contexts[i].get().value->size());
+        if (range.GetValueSize() > read_options.value_size_soft_limit) {
+          *(blob_read_key_contexts[i].get().s) = Status::Aborted();
+        }
+      }
+    }
+  }
+}
+
 void Version::Get(const ReadOptions& read_options, const LookupKey& k,
                   PinnableSlice* value, std::string* timestamp, Status* status,
                   MergeContext* merge_context,
@@ -2085,6 +2200,10 @@ void Version::MultiGet(const ReadOptions& read_options, MultiGetRange* range,
   uint64_t num_data_read = 0;
   uint64_t num_sst_read = 0;
 
+  MultiGetRange keys_with_blobs_range(*range, range->begin(), range->end());
+  // blob_file => [[blob_idx, it], ...]
+  std::unordered_map<uint64_t, BlobReadRequests> blob_rqs;
+
   while (f != nullptr) {
     MultiGetRange file_range = fp.CurrentFileRange();
     bool timer_enabled =
@@ -2170,24 +2289,24 @@ void Version::MultiGet(const ReadOptions& read_options, MultiGetRange* range,
 
           if (iter->is_blob_index) {
             if (iter->value) {
-              constexpr uint64_t* bytes_read = nullptr;
-
-              *status = GetBlob(read_options, iter->ukey_with_ts, *iter->value,
-                                iter->value, bytes_read);
-              if (!status->ok()) {
-                if (status->IsIncomplete()) {
-                  get_context.MarkKeyMayExist();
-                }
-
-                continue;
+              const Slice& blob_index_slice = *(iter->value);
+              BlobIndex blob_index;
+              Status tmp_s = blob_index.DecodeFrom(blob_index_slice);
+              if (tmp_s.ok()) {
+                const uint64_t blob_file_num = blob_index.file_number();
+                blob_rqs[blob_file_num].emplace_back(
+                    std::make_pair(blob_index, std::cref(*iter)));
+              } else {
+                *(iter->s) = tmp_s;
               }
             }
-          }
-
-          file_range.AddValueSize(iter->value->size());
-          if (file_range.GetValueSize() > read_options.value_size_soft_limit) {
-            s = Status::Aborted();
-            break;
+          } else {
+            file_range.AddValueSize(iter->value->size());
+            if (file_range.GetValueSize() >
+                read_options.value_size_soft_limit) {
+              s = Status::Aborted();
+              break;
+            }
           }
           continue;
         case GetContext::kDeleted:
@@ -2231,6 +2350,10 @@ void Version::MultiGet(const ReadOptions& read_options, MultiGetRange* range,
       break;
     }
     f = fp.GetNextFile();
+  }
+
+  if (s.ok() && !blob_rqs.empty()) {
+    MultiGetBlob(read_options, keys_with_blobs_range, blob_rqs);
   }
 
   // Process any left over keys
@@ -2615,7 +2738,12 @@ void VersionStorageInfo::ComputeCompactionScore(
       if (compaction_style_ == kCompactionStyleFIFO) {
         score = static_cast<double>(total_size) /
                 mutable_cf_options.compaction_options_fifo.max_table_files_size;
-        if (mutable_cf_options.compaction_options_fifo.allow_compaction) {
+        if (mutable_cf_options.compaction_options_fifo.allow_compaction ||
+            mutable_cf_options.compaction_options_fifo.age_for_warm > 0) {
+          // Warm tier move can happen at any time. It's too expensive to
+          // check very file's timestamp now. For now, just trigger it
+          // slightly more frequently than FIFO compaction so that this
+          // happens first.
           score = std::max(
               static_cast<double>(num_sorted_runs) /
                   mutable_cf_options.level0_file_num_compaction_trigger,
@@ -2627,7 +2755,6 @@ void VersionStorageInfo::ComputeCompactionScore(
                   immutable_options, mutable_cf_options, files_[level])),
               score);
         }
-
       } else {
         score = static_cast<double>(num_sorted_runs) /
                 mutable_cf_options.level0_file_num_compaction_trigger;
@@ -2690,6 +2817,15 @@ void VersionStorageInfo::ComputeCompactionScore(
     ComputeFilesMarkedForPeriodicCompaction(
         immutable_options, mutable_cf_options.periodic_compaction_seconds);
   }
+
+  if (mutable_cf_options.enable_blob_garbage_collection &&
+      mutable_cf_options.blob_garbage_collection_age_cutoff > 0.0 &&
+      mutable_cf_options.blob_garbage_collection_force_threshold < 1.0) {
+    ComputeFilesMarkedForForcedBlobGC(
+        mutable_cf_options.blob_garbage_collection_age_cutoff,
+        mutable_cf_options.blob_garbage_collection_force_threshold);
+  }
+
   EstimateCompactionBytesNeeded(mutable_cf_options);
 }
 
@@ -2796,6 +2932,106 @@ void VersionStorageInfo::ComputeFilesMarkedForPeriodicCompaction(
         }
       }
     }
+  }
+}
+
+void VersionStorageInfo::ComputeFilesMarkedForForcedBlobGC(
+    double blob_garbage_collection_age_cutoff,
+    double blob_garbage_collection_force_threshold) {
+  files_marked_for_forced_blob_gc_.clear();
+
+  if (blob_files_.empty()) {
+    return;
+  }
+
+  // Number of blob files eligible for GC based on age
+  const size_t cutoff_count = static_cast<size_t>(
+      blob_garbage_collection_age_cutoff * blob_files_.size());
+  if (!cutoff_count) {
+    return;
+  }
+
+  // Compute the sum of total and garbage bytes over the oldest batch of blob
+  // files. The oldest batch is defined as the set of blob files which are
+  // kept alive by the same SSTs as the very oldest one. Here is a toy example.
+  // Let's assume we have three SSTs 1, 2, and 3, and four blob files 10, 11,
+  // 12, and 13. Also, let's say SSTs 1 and 2 both rely on blob file 10 and
+  // potentially some higher-numbered ones, while SST 3 relies on blob file 12
+  // and potentially some higher-numbered ones. Then, the SST to oldest blob
+  // file mapping is as follows:
+  //
+  // SST file number               Oldest blob file number
+  // 1                             10
+  // 2                             10
+  // 3                             12
+  //
+  // This is what the same thing looks like from the blob files' POV. (Note that
+  // the linked SSTs simply denote the inverse mapping of the above.)
+  //
+  // Blob file number              Linked SST set
+  // 10                            {1, 2}
+  // 11                            {}
+  // 12                            {3}
+  // 13                            {}
+  //
+  // Then, the oldest batch of blob files consists of blob files 10 and 11,
+  // and we can get rid of them by forcing the compaction of SSTs 1 and 2.
+  //
+  // Note that the overall ratio of garbage computed for the batch has to exceed
+  // blob_garbage_collection_force_threshold and the entire batch has to be
+  // eligible for GC according to blob_garbage_collection_age_cutoff in order
+  // for us to schedule any compactions.
+  const auto oldest_it = blob_files_.begin();
+
+  const auto& oldest_meta = oldest_it->second;
+  assert(oldest_meta);
+
+  const auto& linked_ssts = oldest_meta->GetLinkedSsts();
+  assert(!linked_ssts.empty());
+
+  size_t count = 1;
+  uint64_t sum_total_blob_bytes = oldest_meta->GetTotalBlobBytes();
+  uint64_t sum_garbage_blob_bytes = oldest_meta->GetGarbageBlobBytes();
+
+  auto it = oldest_it;
+  for (++it; it != blob_files_.end(); ++it) {
+    const auto& meta = it->second;
+    assert(meta);
+
+    if (!meta->GetLinkedSsts().empty()) {
+      break;
+    }
+
+    if (++count > cutoff_count) {
+      return;
+    }
+
+    sum_total_blob_bytes += meta->GetTotalBlobBytes();
+    sum_garbage_blob_bytes += meta->GetGarbageBlobBytes();
+  }
+
+  if (sum_garbage_blob_bytes <
+      blob_garbage_collection_force_threshold * sum_total_blob_bytes) {
+    return;
+  }
+
+  for (uint64_t sst_file_number : linked_ssts) {
+    const FileLocation location = GetFileLocation(sst_file_number);
+    assert(location.IsValid());
+
+    const int level = location.GetLevel();
+    assert(level >= 0);
+
+    const size_t pos = location.GetPosition();
+
+    FileMetaData* const sst_meta = files_[level][pos];
+    assert(sst_meta);
+
+    if (sst_meta->being_compacted) {
+      continue;
+    }
+
+    files_marked_for_forced_blob_gc_.emplace_back(level, sst_meta);
   }
 }
 
@@ -3596,6 +3832,14 @@ uint64_t VersionStorageInfo::EstimateLiveDataSize() const {
       }
     }
   }
+  // For BlobDB, the result also includes the exact value of live bytes in the
+  // blob files of the version.
+  const auto& blobFiles = GetBlobFiles();
+  for (const auto& pair : blobFiles) {
+    const auto& meta = pair.second;
+    size += meta->GetTotalBlobBytes();
+    size -= meta->GetGarbageBlobBytes();
+  }
   return size;
 }
 
@@ -3815,6 +4059,7 @@ VersionSet::VersionSet(const std::string& dbname,
       next_file_number_(2),
       manifest_file_number_(0),  // Filled by Recover()
       options_file_number_(0),
+      options_file_size_(0),
       pending_manifest_file_number_(0),
       last_sequence_(0),
       last_allocated_sequence_(0),
@@ -4224,7 +4469,6 @@ Status VersionSet::ProcessManifestWrites(
       if (!io_s.ok()) {
         s = io_s;
       }
-      TEST_SYNC_POINT("VersionSet::ProcessManifestWrites:AfterNewManifest");
     }
 
     if (s.ok()) {
@@ -4612,9 +4856,9 @@ Status VersionSet::Recover(
     if (!s.ok()) {
       return s;
     }
-    manifest_file_reader.reset(
-        new SequentialFileReader(std::move(manifest_file), manifest_path,
-                                 db_options_->log_readahead_size, io_tracer_));
+    manifest_file_reader.reset(new SequentialFileReader(
+        std::move(manifest_file), manifest_path,
+        db_options_->log_readahead_size, io_tracer_, db_options_->listeners));
   }
   uint64_t current_manifest_file_size = 0;
   uint64_t log_number = 0;
@@ -4784,9 +5028,9 @@ Status VersionSet::TryRecoverFromOneManifest(
     if (!s.ok()) {
       return s;
     }
-    manifest_file_reader.reset(
-        new SequentialFileReader(std::move(manifest_file), manifest_path,
-                                 db_options_->log_readahead_size, io_tracer_));
+    manifest_file_reader.reset(new SequentialFileReader(
+        std::move(manifest_file), manifest_path,
+        db_options_->log_readahead_size, io_tracer_, db_options_->listeners));
   }
 
   assert(s.ok());
@@ -5647,7 +5891,7 @@ ColumnFamilyData* VersionSet::CreateColumnFamily(
   // GetLatestMutableCFOptions() is safe here without mutex since the
   // cfd is not available to client
   new_cfd->CreateNewMemtable(*new_cfd->GetLatestMutableCFOptions(),
-                             LastSequence(), edit->log_number_);
+                             LastSequence());
   new_cfd->SetLogNumber(edit->log_number_);
   return new_cfd;
 }
@@ -5676,6 +5920,25 @@ uint64_t VersionSet::GetTotalSstFilesSize(Version* dummy_versions) {
     }
   }
   return total_files_size;
+}
+
+uint64_t VersionSet::GetTotalBlobFileSize(Version* dummy_versions) {
+  std::unordered_set<uint64_t> unique_blob_files;
+  uint64_t all_v_blob_file_size = 0;
+  for (auto* v = dummy_versions->next_; v != dummy_versions; v = v->next_) {
+    // iterate all the versions
+    auto* vstorage = v->storage_info();
+    const auto& blob_files = vstorage->GetBlobFiles();
+    for (const auto& pair : blob_files) {
+      if (unique_blob_files.find(pair.first) == unique_blob_files.end()) {
+        // find Blob file that has not been counted
+        unique_blob_files.insert(pair.first);
+        const auto& meta = pair.second;
+        all_v_blob_file_size += meta->GetBlobFileSize();
+      }
+    }
+  }
+  return all_v_blob_file_size;
 }
 
 Status VersionSet::VerifyFileMetadata(const std::string& fpath,
@@ -5716,6 +5979,9 @@ Status ReactiveVersionSet::Recover(
   static_cast_with_check<LogReporter>(manifest_reporter->get())->status =
       manifest_reader_status->get();
   Status s = MaybeSwitchManifest(manifest_reporter->get(), manifest_reader);
+  if (!s.ok()) {
+    return s;
+  }
   log::Reader* reader = manifest_reader->get();
   assert(reader);
 
@@ -5757,43 +6023,62 @@ Status ReactiveVersionSet::MaybeSwitchManifest(
     std::unique_ptr<log::FragmentBufferedReader>* manifest_reader) {
   assert(manifest_reader != nullptr);
   Status s;
-  do {
-    std::string manifest_path;
-    s = GetCurrentManifestPath(dbname_, fs_.get(), &manifest_path,
-                               &manifest_file_number_);
-    std::unique_ptr<FSSequentialFile> manifest_file;
-    if (s.ok()) {
-      if (nullptr == manifest_reader->get() ||
-          manifest_reader->get()->file()->file_name() != manifest_path) {
-        TEST_SYNC_POINT(
-            "ReactiveVersionSet::MaybeSwitchManifest:"
-            "AfterGetCurrentManifestPath:0");
-        TEST_SYNC_POINT(
-            "ReactiveVersionSet::MaybeSwitchManifest:"
-            "AfterGetCurrentManifestPath:1");
-        s = fs_->NewSequentialFile(manifest_path,
-                                   fs_->OptimizeForManifestRead(file_options_),
-                                   &manifest_file, nullptr);
-      } else {
-        // No need to switch manifest.
-        break;
-      }
+  std::string manifest_path;
+  s = GetCurrentManifestPath(dbname_, fs_.get(), &manifest_path,
+                             &manifest_file_number_);
+  if (!s.ok()) {
+    return s;
+  }
+  std::unique_ptr<FSSequentialFile> manifest_file;
+  if (manifest_reader->get() != nullptr &&
+      manifest_reader->get()->file()->file_name() == manifest_path) {
+    // CURRENT points to the same MANIFEST as before, no need to switch
+    // MANIFEST.
+    return s;
+  }
+  assert(nullptr == manifest_reader->get() ||
+         manifest_reader->get()->file()->file_name() != manifest_path);
+  s = fs_->FileExists(manifest_path, IOOptions(), nullptr);
+  if (s.IsNotFound()) {
+    return Status::TryAgain(
+        "The primary may have switched to a new MANIFEST and deleted the old "
+        "one.");
+  } else if (!s.ok()) {
+    return s;
+  }
+  TEST_SYNC_POINT(
+      "ReactiveVersionSet::MaybeSwitchManifest:"
+      "AfterGetCurrentManifestPath:0");
+  TEST_SYNC_POINT(
+      "ReactiveVersionSet::MaybeSwitchManifest:"
+      "AfterGetCurrentManifestPath:1");
+  // The primary can also delete the MANIFEST while the secondary is reading
+  // it. This is OK on POSIX. For other file systems, maybe create a hard link
+  // to MANIFEST. The hard link should be cleaned up later by the secondary.
+  s = fs_->NewSequentialFile(manifest_path,
+                             fs_->OptimizeForManifestRead(file_options_),
+                             &manifest_file, nullptr);
+  std::unique_ptr<SequentialFileReader> manifest_file_reader;
+  if (s.ok()) {
+    manifest_file_reader.reset(new SequentialFileReader(
+        std::move(manifest_file), manifest_path,
+        db_options_->log_readahead_size, io_tracer_, db_options_->listeners));
+    manifest_reader->reset(new log::FragmentBufferedReader(
+        nullptr, std::move(manifest_file_reader), reporter, true /* checksum */,
+        0 /* log_number */));
+    ROCKS_LOG_INFO(db_options_->info_log, "Switched to new manifest: %s\n",
+                   manifest_path.c_str());
+    if (manifest_tailer_) {
+      manifest_tailer_->PrepareToReadNewManifest();
     }
-    std::unique_ptr<SequentialFileReader> manifest_file_reader;
-    if (s.ok()) {
-      manifest_file_reader.reset(new SequentialFileReader(
-          std::move(manifest_file), manifest_path,
-          db_options_->log_readahead_size, io_tracer_));
-      manifest_reader->reset(new log::FragmentBufferedReader(
-          nullptr, std::move(manifest_file_reader), reporter,
-          true /* checksum */, 0 /* log_number */));
-      ROCKS_LOG_INFO(db_options_->info_log, "Switched to new manifest: %s\n",
-                     manifest_path.c_str());
-      if (manifest_tailer_) {
-        manifest_tailer_->PrepareToReadNewManifest();
-      }
-    }
-  } while (s.IsPathNotFound());
+  } else if (s.IsPathNotFound()) {
+    // This can happen if the primary switches to a new MANIFEST after the
+    // secondary reads the CURRENT file but before the secondary actually tries
+    // to open the MANIFEST.
+    s = Status::TryAgain(
+        "The primary may have switched to a new MANIFEST and deleted the old "
+        "one.");
+  }
   return s;
 }
 
