@@ -216,11 +216,6 @@ Status CheckpointImpl::CreateCustomCheckpoint(
     std::function<int()> consistentPointCallback) {
   *sequence_number = db_->GetLatestSequenceNumber();
 
-  if (consistentPointCallback != nullptr) {
-    if (consistentPointCallback() != 0)
-      return Status::IOError();
-  }
-
   LiveFilesStorageInfoOptions opts;
   opts.include_checksum_info = get_live_table_checksum;
   opts.wal_size_for_flush = log_size_for_flush;
@@ -244,6 +239,11 @@ Status CheckpointImpl::CreateCustomCheckpoint(
   if (dirs.size() > 1) {
     return Status::NotSupported(
         "db_paths / cf_paths not supported for Checkpoint nor BackupEngine");
+  }
+
+  if (consistentPointCallback != nullptr) {
+    if (consistentPointCallback() != 0)
+      return Status::IOError();
   }
 
   bool same_fs = true;
