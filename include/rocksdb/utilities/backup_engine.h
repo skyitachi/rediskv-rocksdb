@@ -266,6 +266,8 @@ struct CreateBackupOptions {
 
   std::function<int()> consistentPointCallback = nullptr;
 
+  std::function<void(uint32_t curr, uint32_t total, uint64_t size)> statsCallback = nullptr;
+
   // If false, background_thread_cpu_priority is ignored.
   // Otherwise, the cpu priority can be decreased,
   // if you try to increase the priority, the priority will not change.
@@ -494,6 +496,14 @@ class BackupEngineAppendOnlyBase {
                                              std::function<int()> consistentPointCallback) {
     CreateBackupOptions options;
     options.consistentPointCallback = consistentPointCallback;
+    return CreateNewBackup(options, db);
+  }
+
+  virtual Status CreateNewBackupWithStats(DB* db,
+                                          std::function<void(uint32_t, uint32_t, 
+                                                             uint64_t)> statsCallback) {
+    CreateBackupOptions options;
+    options.statsCallback = statsCallback;
     return CreateNewBackup(options, db);
   }
 

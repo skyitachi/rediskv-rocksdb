@@ -165,6 +165,12 @@ extern void rocksdb_backup_engine_create_new_backup_with_sequence(
     int(*consistentPointCallback)(),
     char** errptr);
 
+extern void rocksdb_backup_engine_create_new_backup_with_stats(
+    rocksdb_backup_engine_t* be,
+    rocksdb_t* db,
+    void(*statsCallback)(uint32_t, uint32_t, uint64_t),
+    char** errptr);
+
 extern ROCKSDB_LIBRARY_API void rocksdb_backup_engine_purge_old_backups(
     rocksdb_backup_engine_t* be, uint32_t num_backups_to_keep, char** errptr);
 

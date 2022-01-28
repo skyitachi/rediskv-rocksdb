@@ -1454,6 +1454,10 @@ IOStatus BackupEngineImpl::CreateNewBackupWithMetadata(
     if (!item_io_status.ok()) {
       io_s = item_io_status;
     }
+    if (options.statsCallback != nullptr) {
+      options.statsCallback(new_backup->GetNumberFiles(), backup_items_to_finish.size(),
+                            new_backup->GetSize());
+    }
   }
 
   // we copied all the files, enable file deletions
