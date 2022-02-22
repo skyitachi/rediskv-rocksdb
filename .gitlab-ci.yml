@@ -3,7 +3,7 @@ stages:
 
 debugJob:
     stage: build
-    image: projecteru2/cli
+    image: projecteru2/cli:v22.02.14-rc.1
     only:
         refs:
             - test-not-used-now
@@ -15,7 +15,7 @@ debugJob:
 
 releaseJob:
     stage: build
-    image: projecteru2/cli
+    image: projecteru2/cli:v22.02.14-rc.1
     only:
         refs:
             - tags
