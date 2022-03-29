@@ -540,7 +540,7 @@ class BackupEngineImpl {
   IOStatus CopyOrCreateFile(const std::string& src, const std::string& dst,
                             const std::string& contents, uint64_t size_limit,
                             Env* src_env, Env* dst_env,
-                            const EnvOptions& src_env_options, bool sync,
+                            const EnvOptions& src_env_options, bool sync, bool trylink,
                             RateLimiter* rate_limiter,
                             std::function<void()> progress_callback,
                             uint64_t* bytes_toward_next_callback,
@@ -587,6 +587,7 @@ class BackupEngineImpl {
     Env* dst_env;
     EnvOptions src_env_options;
     bool sync;
+    bool trylink;
     RateLimiter* rate_limiter;
     uint64_t size_limit;
     Statistics* stats;
@@ -605,6 +606,7 @@ class BackupEngineImpl {
           dst_env(nullptr),
           src_env_options(),
           sync(false),
+          trylink(false),
           rate_limiter(nullptr),
           size_limit(0),
           stats(nullptr),
@@ -628,6 +630,7 @@ class BackupEngineImpl {
       dst_env = o.dst_env;
       src_env_options = std::move(o.src_env_options);
       sync = o.sync;
+      trylink = o.trylink;
       rate_limiter = o.rate_limiter;
       size_limit = o.size_limit;
       stats = o.stats;
@@ -642,7 +645,7 @@ class BackupEngineImpl {
 
     CopyOrCreateWorkItem(
         std::string _src_path, std::string _dst_path, std::string _contents,
-        Env* _src_env, Env* _dst_env, EnvOptions _src_env_options, bool _sync,
+        Env* _src_env, Env* _dst_env, EnvOptions _src_env_options, bool _sync, bool _trylink,
         RateLimiter* _rate_limiter, uint64_t _size_limit, Statistics* _stats,
         std::function<void()> _progress_callback = []() {},
         const std::string& _src_checksum_func_name =
@@ -656,6 +659,7 @@ class BackupEngineImpl {
           dst_env(_dst_env),
           src_env_options(std::move(_src_env_options)),
           sync(_sync),
+          trylink(_trylink),
           rate_limiter(_rate_limiter),
           size_limit(_size_limit),
           stats(_stats),
@@ -1184,7 +1188,7 @@ IOStatus BackupEngineImpl::Initialize() {
         result.io_status = CopyOrCreateFile(
             work_item.src_path, work_item.dst_path, work_item.contents,
             work_item.size_limit, work_item.src_env, work_item.dst_env,
-            work_item.src_env_options, work_item.sync, work_item.rate_limiter,
+            work_item.src_env_options, work_item.sync, work_item.trylink, work_item.rate_limiter,
             work_item.progress_callback, &bytes_toward_next_callback,
             &result.size, &result.checksum_hex);
 
@@ -1196,32 +1200,36 @@ IOStatus BackupEngineImpl::Initialize() {
         result.db_id = work_item.db_id;
         result.db_session_id = work_item.db_session_id;
         if (result.io_status.ok() && !work_item.src_checksum_hex.empty()) {
-          // unknown checksum function name implies no db table file checksum in
-          // db manifest; work_item.src_checksum_hex not empty means
-          // backup engine has calculated its crc32c checksum for the table
-          // file; therefore, we are able to compare the checksums.
-          if (work_item.src_checksum_func_name ==
-                  kUnknownFileChecksumFuncName ||
-              work_item.src_checksum_func_name == kDbFileChecksumFuncName) {
-            if (work_item.src_checksum_hex != result.checksum_hex) {
-              std::string checksum_info(
-                  "Expected checksum is " + work_item.src_checksum_hex +
-                  " while computed checksum is " + result.checksum_hex);
-              result.io_status = IOStatus::Corruption(
-                  "Checksum mismatch after copying to " + work_item.dst_path +
-                  ": " + checksum_info);
-            }
+          if (work_item.trylink) {
+            // no checksum check for hard link
           } else {
-            // FIXME(peterd): dead code?
-            std::string checksum_function_info(
-                "Existing checksum function is " +
-                work_item.src_checksum_func_name +
-                " while provided checksum function is " +
-                kBackupFileChecksumFuncName);
-            ROCKS_LOG_INFO(
-                options_.info_log,
-                "Unable to verify checksum after copying to %s: %s\n",
-                work_item.dst_path.c_str(), checksum_function_info.c_str());
+            // unknown checksum function name implies no db table file checksum in
+            // db manifest; work_item.src_checksum_hex not empty means
+            // backup engine has calculated its crc32c checksum for the table
+            // file; therefore, we are able to compare the checksums.
+            if (work_item.src_checksum_func_name ==
+                    kUnknownFileChecksumFuncName ||
+                work_item.src_checksum_func_name == kDbFileChecksumFuncName) {
+              if (work_item.src_checksum_hex != result.checksum_hex) {
+                std::string checksum_info(
+                    "Expected checksum is " + work_item.src_checksum_hex +
+                    " while computed checksum is " + result.checksum_hex);
+                result.io_status = IOStatus::Corruption(
+                    "Checksum mismatch after copying to " + work_item.dst_path +
+                    ": " + checksum_info);
+              }
+            } else {
+              // FIXME(peterd): dead code?
+              std::string checksum_function_info(
+                  "Existing checksum function is " +
+                  work_item.src_checksum_func_name +
+                  " while provided checksum function is " +
+                  kBackupFileChecksumFuncName);
+              ROCKS_LOG_INFO(
+                  options_.info_log,
+                  "Unable to verify checksum after copying to %s: %s\n",
+                  work_item.dst_path.c_str(), checksum_function_info.c_str());
+            }
           }
         }
         work_item.result.set_value(std::move(result));
@@ -1841,7 +1849,7 @@ IOStatus BackupEngineImpl::RestoreDBFromBackup(
                    dst.c_str());
     CopyOrCreateWorkItem copy_or_create_work_item(
         GetAbsolutePath(file), dst, "" /* contents */, backup_env_, db_env_,
-        EnvOptions() /* src_env_options */, options_.sync,
+        EnvOptions() /* src_env_options */, options_.sync, true /* try hardlink */,
         options_.restore_rate_limiter.get(), 0 /* size_limit */,
         nullptr /* stats */);
     RestoreAfterCopyOrCreateWorkItem after_copy_or_create_work_item(
@@ -1862,6 +1870,7 @@ IOStatus BackupEngineImpl::RestoreDBFromBackup(
       io_s = item_io_status;
       break;
     } else if (!item.checksum_hex.empty() &&
+               !result.checksum_hex.empty() &&
                item.checksum_hex != result.checksum_hex) {
       io_s = IOStatus::Corruption(
           "While restoring " + item.from_file + " -> " + item.to_file +
@@ -1975,7 +1984,7 @@ IOStatus BackupEngineImpl::VerifyBackup(BackupID backup_id,
 IOStatus BackupEngineImpl::CopyOrCreateFile(
     const std::string& src, const std::string& dst, const std::string& contents,
     uint64_t size_limit, Env* src_env, Env* dst_env,
-    const EnvOptions& src_env_options, bool sync, RateLimiter* rate_limiter,
+    const EnvOptions& src_env_options, bool sync, bool trylink, RateLimiter* rate_limiter,
     std::function<void()> progress_callback,
     uint64_t* bytes_toward_next_callback, uint64_t* size,
     std::string* checksum_hex) {
@@ -1994,6 +2003,20 @@ IOStatus BackupEngineImpl::CopyOrCreateFile(
   // Check if size limit is set. if not, set it to very big number
   if (size_limit == 0) {
     size_limit = std::numeric_limits<uint64_t>::max();
+  }
+
+  if (!src.empty() && trylink) {
+    uint64_t file_size;
+    io_s = src_env->GetFileSystem()->GetFileSize(src, IOOptions(), &file_size, nullptr);
+    if (io_s.ok()) {
+      io_s = dst_env->GetFileSystem()->LinkFile(src, dst, IOOptions(), nullptr);
+      if (io_s.ok()) {
+        *size = file_size;
+        return io_s;
+      }
+    } else {
+      return io_s;
+    }
   }
 
   io_s = dst_env->GetFileSystem()->NewWritableFile(dst, dst_file_options,
@@ -2282,7 +2305,7 @@ IOStatus BackupEngineImpl::AddBackupFileWorkItem(
                    copy_dest_path->c_str());
     CopyOrCreateWorkItem copy_or_create_work_item(
         src_dir.empty() ? "" : src_path, *copy_dest_path, contents, db_env_,
-        backup_env_, src_env_options, options_.sync, rate_limiter, size_limit,
+        backup_env_, src_env_options, options_.sync, false,  rate_limiter, size_limit,
         stats, progress_callback, src_checksum_func_name, checksum_hex, db_id,
         db_session_id);
     BackupAfterCopyOrCreateWorkItem after_copy_or_create_work_item(
