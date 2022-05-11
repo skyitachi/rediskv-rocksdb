@@ -4426,7 +4426,7 @@ rocksdb_backup_engine_t* rocksdb_s3_backup_engine_open(
       new ROCKSDB_NAMESPACE::S3Env(prefix, local_path, s3_util);
 
   if (SaveError(errptr, BackupEngine::Open(options->rep.env,
-          BackupableDBOptions(prefix,
+          BackupableDBOptions(local_path,
                               s3_env,
                               true,
                               options->rep.info_log.get()),

@@ -32,28 +32,28 @@ Status S3Env::NewSequentialFile(const std::string& fname,
   assert(s3_util_ != nullptr);
   result->reset();
   // We read first from local storage and then from S3.
-  auto local_full_path = local_directory_ + GetRelativePath(fname);
-  auto st = posix_env_->NewSequentialFile(local_full_path, result, options);
+  auto remote_full_path = GetRemotePath(fname);
+  auto st = posix_env_->NewSequentialFile(fname, result, options);
 
   if (!st.ok()) {
     // If file doesnt exist in local, we copy the file to the local storage from S3
-    size_t slash = local_full_path.find_last_of('/');
+    size_t slash = fname.find_last_of('/');
     assert(slash != std::string::npos);
 
-    auto dir = local_full_path.substr(0, slash);
+    auto dir = fname.substr(0, slash);
     if (!posix_env_->FileExists(dir).ok()) {
-      st = posix_env_->CreateDir(local_full_path.substr(0, slash));
+      st = posix_env_->CreateDir(fname.substr(0, slash));
       if (!st.ok()) return Status::IOError();
     }
 
-    auto resp = s3_util_->getObject(fname, local_full_path, s3_direct_io);
+    auto resp = s3_util_->getObject(remote_full_path, fname, s3_direct_io);
     if (!resp.Error().empty()) {
       return Status::IOError();
     }
   }
 
   // we successfully copied the file, try opening it locally now
-  return posix_env_->NewSequentialFile(local_full_path, result, options);
+  return posix_env_->NewSequentialFile(fname, result, options);
 }
 
 // open a file for random reading
@@ -64,24 +64,24 @@ Status S3Env::NewRandomAccessFile(const std::string& fname,
   result->reset();
 
   // We read first from local storage and then from S3.
-  auto local_full_path = local_directory_ + GetRelativePath(fname);
-  auto st = posix_env_->NewRandomAccessFile(local_full_path, result, options);
+  auto remote_full_path = GetRemotePath(fname);
+  auto st = posix_env_->NewRandomAccessFile(fname, result, options);
 
   if (!st.ok()) {
     // If file doesnt exist in local, we copy the file to the local storage from S3
-    size_t slash = local_full_path.find_last_of('/');
+    size_t slash = fname.find_last_of('/');
     assert(slash != std::string::npos);
-    st = posix_env_->CreateDir(local_full_path.substr(0, slash));
+    st = posix_env_->CreateDir(fname.substr(0, slash));
     if (!st.ok()) return Status::IOError();
 
-    auto resp = s3_util_->getObject(fname, local_full_path, s3_direct_io);
+    auto resp = s3_util_->getObject(remote_full_path, fname, s3_direct_io);
     if (!resp.Error().empty()) {
       return Status::IOError();
     }
   }
 
   // we successfully copied the file, try opening it locally now
-  return posix_env_->NewRandomAccessFile(local_full_path, result, options);
+  return posix_env_->NewRandomAccessFile(fname, result, options);
 }
 
 // S3WritableFile is a wrapper for writing a file in S3. We will perform the
@@ -216,8 +216,9 @@ Status S3Env::NewWritableFile(const std::string& fname,
   assert(s3_util_ != nullptr);
   result->reset();
 
+  auto remote_full_path = GetRemotePath(fname);
   std::unique_ptr<S3WritableFile> f(
-      new S3WritableFile(local_directory_ + GetRelativePath(fname), fname, options, this, s3_util_));
+      new S3WritableFile(fname, remote_full_path, options, this, s3_util_));
   auto s = f->status();
   if (!s.ok()) {
     return s;
@@ -256,9 +257,8 @@ Status S3Env::NewDirectory(const std::string& name,
                            std::unique_ptr<Directory>* result) {
   result->reset(nullptr);
 
-  auto local_dir_path = local_directory_ + GetRelativePath(name);
   // create new object.
-  std::unique_ptr<S3Directory> d(new S3Directory(this, local_dir_path));
+  std::unique_ptr<S3Directory> d(new S3Directory(this, name));
 
   // Check if the path exists in local dir
   if (!d->status().ok()) {
@@ -271,9 +271,11 @@ Status S3Env::NewDirectory(const std::string& name,
 
 Status S3Env::FileExists(const std::string& fname) {
   // We read first from local storage and then from S3
-  auto st = posix_env_->FileExists(local_directory_ + GetRelativePath(fname));
+  auto remote_full_path = GetRemotePath(fname);
+
+  auto st = posix_env_->FileExists(fname);
   if (st.IsNotFound()) {
-    auto resp = s3_util_->listObjects(fname);
+    auto resp = s3_util_->listObjects(remote_full_path);
     if (!resp.Error().empty() || resp.Body().empty()) {
       return Status::NotFound();
     }
@@ -291,9 +293,9 @@ inline std::string ensure_ends_with_pathsep(const std::string& s) {
 
 Status S3Env::GetChildren(const std::string& path,
                           std::vector<std::string>* result) {
-  auto formated_path = ensure_ends_with_pathsep(path);
   // fetch all files using the given path as the key prefix in S3
-  auto resp = s3_util_->listAllObjects(formated_path);
+  auto remote_full_path = ensure_ends_with_pathsep(GetRemotePath(path));
+  auto resp = s3_util_->listAllObjects(remote_full_path);
   if (!resp.Error().empty()) {
     return Status::IOError();
   }
@@ -301,8 +303,8 @@ Status S3Env::GetChildren(const std::string& path,
   // trim the file name
   for (auto& v : resp.Body().objects) {
     // the path should be a prefix of the fetched value
-    if (v.find(formated_path) == 0) {
-      result->push_back(v.substr(formated_path.size()));
+    if (v.find(remote_full_path) == 0) {
+      result->push_back(v.substr(remote_full_path.size()));
     }
   }
 
@@ -311,42 +313,44 @@ Status S3Env::GetChildren(const std::string& path,
 
 Status S3Env::DeleteFile(const std::string& fname) {
   // first delete the file from s3
-  auto resp = s3_util_->deleteObject(fname);
+  auto remote_full_path = GetRemotePath(fname);
+  auto resp = s3_util_->deleteObject(remote_full_path);
   if (!resp.Error().empty()) {
     return Status::IOError();
   }
 
   // Do the delete from local filesystem too and ignore the error
-  posix_env_->DeleteFile(local_directory_ + GetRelativePath(fname));
+  posix_env_->DeleteFile(fname);
   return Status::OK();
 }
 
 // S3 has no concepts of directories, so we just have to forward the request to
 // posix_env_
 Status S3Env::CreateDir(const std::string& name) {
-  return posix_env_->CreateDir(local_directory_ + GetRelativePath(name));
+  return posix_env_->CreateDir(name);
 };
 
 // S3 has no concepts of directories, so we just have to forward the request to
 // posix_env_
 Status S3Env::CreateDirIfMissing(const std::string& name) {
-  return posix_env_->CreateDirIfMissing(local_directory_ + GetRelativePath(name));
+  return posix_env_->CreateDirIfMissing(name);
 };
 
 // S3 has no concepts of directories, so we just have to forward the request to
 // posix_env_
 Status S3Env::DeleteDir(const std::string& name) {
-  return posix_env_->DeleteDir(local_directory_ + GetRelativePath(name));
+  return posix_env_->DeleteDir(name);
 };
 
 Status S3Env::GetFileSize(const std::string& fname, uint64_t* size) {
   Status st;
-  auto local_path = local_directory_ + GetRelativePath(fname);
-  if (posix_env_->FileExists(local_path).ok()) {
-    st = posix_env_->GetFileSize(local_path, size);
+  auto remote_full_path = GetRemotePath(fname);
+
+  if (posix_env_->FileExists(fname).ok()) {
+    st = posix_env_->GetFileSize(fname, size);
   } else {
     st = Status::NotFound();
-    auto meta_resp = s3_util_->getObjectSizeAndModTime(fname);
+    auto meta_resp = s3_util_->getObjectSizeAndModTime(remote_full_path);
     const auto& size_itr = meta_resp.Body().find("size");
     if (size_itr != meta_resp.Body().end()) {
       *size = size_itr->second;
@@ -360,12 +364,12 @@ Status S3Env::GetFileSize(const std::string& fname, uint64_t* size) {
 Status S3Env::GetFileModificationTime(const std::string& fname,
                                       uint64_t* file_mtime) {
   Status st;
-  auto local_path = local_directory_ + GetRelativePath(fname);
-  if (posix_env_->FileExists(local_path).ok()) {
-    st = posix_env_->GetFileModificationTime(local_path, file_mtime);
+  auto remote_full_path = GetRemotePath(fname);
+  if (posix_env_->FileExists(fname).ok()) {
+    st = posix_env_->GetFileModificationTime(fname, file_mtime);
   } else {
     st = Status::NotFound();
-    auto meta_resp = s3_util_->getObjectSizeAndModTime(fname);
+    auto meta_resp = s3_util_->getObjectSizeAndModTime(remote_full_path);
     const auto& mtime_itr = meta_resp.Body().find("last-modified");
     if (mtime_itr != meta_resp.Body().end()) {
       *file_mtime = mtime_itr->second;
@@ -379,20 +383,20 @@ Status S3Env::GetFileModificationTime(const std::string& fname,
 // The rename is not atomic. S3 does not support renaming natively, so
 // we perform the renaming in local and then upload the updated file to S3.
 Status S3Env::RenameFile(const std::string& src, const std::string& target) {
-  auto local_src_path = local_directory_ + GetRelativePath(src);
-  auto local_target_path = local_directory_ + GetRelativePath(target);
-  Status st = posix_env_->RenameFile(local_src_path, local_target_path);
+  auto remote_src_path = GetRemotePath(src);
+  auto remote_target_path = GetRemotePath(target);
+
+  Status st = posix_env_->RenameFile(src, target);
   if (!st.ok()) {
     return st;
   }
-
   bool is_dir;
-  st = posix_env_->IsDirectory(local_target_path, &is_dir);
+  st = posix_env_->IsDirectory(target, &is_dir);
   if (!st.ok()) return st;
 
   if (is_dir) {
     std::vector<std::string> files;
-    st = posix_env_->GetChildren(local_target_path, &files);
+    st = posix_env_->GetChildren(target, &files);
     if (!st.ok()) {
       return st;
     }
@@ -400,19 +404,23 @@ Status S3Env::RenameFile(const std::string& src, const std::string& target) {
       if (file == "." || file == "..") {
         continue;
       }
-      auto copy_resp = s3_util_->putObject(target + file, local_target_path + file);
+      auto copy_resp = s3_util_->putObject(remote_target_path + file, target + file);
       if (!copy_resp.Error().empty()) {
         return Status::IOError();
       }
     }
   } else {
-    auto copy_resp = s3_util_->putObject(target, local_target_path);
+    auto copy_resp = s3_util_->putObject(remote_target_path, target);
     if (!copy_resp.Error().empty()) {
       return Status::IOError();
     }
   }
 
   return Status::OK();
+}
+
+Status S3Env::LinkFile(const std::string& src, const std::string& target) {
+  return posix_env_->LinkFile(src, target);
 }
 
 Status S3Env::LockFile(const std::string& fname, FileLock** lock) {

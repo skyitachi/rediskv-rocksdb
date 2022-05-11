@@ -106,9 +106,7 @@ class S3Env : public Env {
   Status RenameFile(const std::string& src, const std::string& target) override;
 
   Status LinkFile(const std::string& /*src*/,
-                  const std::string& /*target*/) override {
-    return Status::NotSupported(); // not supported
-  }
+                  const std::string& /*target*/) override;
 
   Status LockFile(const std::string& fname, FileLock** lock) override;
 
@@ -159,6 +157,7 @@ class S3Env : public Env {
 
   Status GetAbsolutePath(const std::string& db_path,
                          std::string* output_path) override {
+    printf("get path abs %s\n", output_path->c_str());
     return posix_env_->GetAbsolutePath(db_path, output_path);
   }
 
@@ -202,10 +201,14 @@ class S3Env : public Env {
 
   inline std::string GetRelativePath(
       const std::string &absolute_path = "") const {
-    assert(absolute_path.size() > s3_key_prefix_.size() + 1);
-    return absolute_path.substr(s3_key_prefix_.size() + 1);
+    assert(absolute_path.size() > local_directory_.size() + 1);
+    return absolute_path.substr(local_directory_.size() + 1);
   }
 
+  inline std::string GetRemotePath(
+      const std::string &absolute_path = "") const {
+    return s3_key_prefix_ + "/" + GetRelativePath(absolute_path);
+  }
 };
 
 }  // namespace rocksdb
