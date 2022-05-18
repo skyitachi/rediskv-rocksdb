@@ -31,6 +31,7 @@
 #include <aws/s3/model/ListObjectsResult.h>
 #include <aws/s3/model/Object.h>
 #include <aws/s3/model/PutObjectRequest.h>
+#include <aws/core/utils/HashingUtils.h>
 
 #include <algorithm>
 #include <cstdlib>
@@ -51,6 +52,7 @@ using Aws::S3::Model::GetObjectRequest;
 using Aws::S3::Model::ListObjectsRequest;
 using Aws::S3::Model::HeadObjectRequest;
 using Aws::S3::Model::PutObjectRequest;
+using Aws::Utils::HashingUtils;
 
 // Number of pages we need to set to direct io buffer
 int direct_io_buffer_n_pages = 1;
@@ -138,18 +140,34 @@ std::streamsize DirectIOWritableFile::write(const char* s, std::streamsize n) {
   return n;
 }
 
-
 GetObjectResponse S3Util::getObject(
     const string& key, const string& local_path, const bool direct_io) {
-  auto getObjectResult = sdkGetObject(key, local_path, direct_io);
-  string err_msg_prefix =
-    "Failed to download from " + key + " to " + local_path + " error: ";
-  if (getObjectResult.IsSuccess()) {
-    return GetObjectResponse(true, "");
-  } else {
-    return GetObjectResponse(false,
-        std::move(err_msg_prefix + getObjectResult.GetError().GetMessage()));
+  Aws::String etag;
+  {
+    auto getObjectResult = sdkGetObject(key, local_path, direct_io);
+    if (getObjectResult.IsSuccess()) {
+      etag = getObjectResult.GetResult().GetETag();
+      etag.erase(std::remove(etag.begin(), etag.end(), '\"'), etag.end());
+    } else {
+      string err_msg_prefix =
+        "Failed to download from " + key + " to " + local_path + " error: ";
+      return GetObjectResponse(false,
+          std::move(err_msg_prefix + getObjectResult.GetError().GetMessage()));
+    }
   }
+
+  auto body = Aws::MakeShared<Aws::FStream>("T",
+                                            local_path.c_str(),
+                                            std::ios_base::in | std::ios_base::binary);
+  auto md5 = HashingUtils::HexEncode(HashingUtils::CalculateMD5(*body));
+  if (etag == md5) {
+      return GetObjectResponse(true, "");
+  }
+
+  string err_msg_prefix =
+    "Failed to verify " + local_path + " error: ";
+  return GetObjectResponse(false,
+      std::move(err_msg_prefix + "md5sum mismatch"));
 }
 
 GetObjectResponse S3Util::getObject(const string& key, iostream* out) {
@@ -371,6 +389,7 @@ PutObjectResponse S3Util::putObject(const string& key, const string& local_path,
                                                   local_path.c_str(),
                                                   std::ios_base::in | std::ios_base::binary);
   object_request.SetBody(input_data);
+  object_request.SetContentMD5(HashingUtils::Base64Encode(HashingUtils::CalculateMD5(*object_request.GetBody())));
   auto put_result = s3Client->PutObject(object_request);
 
   if (put_result.IsSuccess()) {
