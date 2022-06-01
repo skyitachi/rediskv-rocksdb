@@ -5659,6 +5659,14 @@ void rocksdb_cancel_all_background_work(rocksdb_t* db, unsigned char wait) {
   CancelAllBackgroundWork(db->rep, wait);
 }
 
+void rocksdb_disable_manual_compaction(rocksdb_t* db) {
+  db->rep->DisableManualCompaction();
+}
+
+void rocksdb_enable_manual_compaction(rocksdb_t* db) {
+  db->rep->EnableManualCompaction();
+}
+
 uint64_t rocksdb_get_total_size(rocksdb_t *db) {
   auto options = db->rep->GetOptions();
   auto sfm = options.sst_file_manager.get();
