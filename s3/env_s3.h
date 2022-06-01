@@ -207,7 +207,9 @@ class S3Env : public Env {
 
   inline std::string GetRemotePath(
       const std::string &absolute_path = "") const {
-    return s3_key_prefix_ + "/" + GetRelativePath(absolute_path);
+    if (!s3_key_prefix_.empty())
+      return s3_key_prefix_ + "/" + GetRelativePath(absolute_path);
+    return GetRelativePath(absolute_path);
   }
 };
 
